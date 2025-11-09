@@ -33,6 +33,8 @@ namespace StorybrewEditor.Storyboarding
         public override double Scale { get; set; } = 1f;
         public override bool ReverseDepth { get; set; }
 
+        public override IReadOnlyList<StoryboardObject> Objects => storyboardObjects;
+
         public event ChangedHandler OnChanged;
         protected void RaiseChanged(string propertyName)
             => EventHelper.InvokeStrict(() => OnChanged, d => ((ChangedHandler)d)(this, new ChangedEventArgs(propertyName)));

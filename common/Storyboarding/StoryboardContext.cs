@@ -13,6 +13,7 @@ namespace StorybrewCommon.Storyboarding
         private readonly Dictionary<string, StoryboardLayer> layers;
         private readonly object syncRoot = new object();
         private StoryboardLayer unnamedLayer;
+        private Func<string, StoryboardLayer> layerFactory;
 
         public StoryboardContext()
             : this(StringComparer.Ordinal)
@@ -35,64 +36,115 @@ namespace StorybrewCommon.Storyboarding
         public int Version { get; private set; }
 
         /// <summary>
-        /// Retrieves an existing layer or creates a new one using the provided factory.
-        /// </summary>
-        public StoryboardLayer GetLayer(string identifier, Func<string, StoryboardLayer> factory)
+/// Attaches a creation factory that will be invoked the first time an identifier is requested.
+/// Subsequent calls keep the first factory to guarantee consistent layer types.
+/// </summary>
+public void AttachLayerFactory(Func<string, StoryboardLayer> factory)
+{
+    if (layerFactory == null)
+        layerFactory = factory;
+}
+
+/// <summary>
+/// Retrieves an existing layer or creates a new one using the provided factory.
+/// </summary>
+public StoryboardLayer GetLayer(string identifier, Func<string, StoryboardLayer> factory)
+{
+    if (identifier == null)
+    {
+        // Unnamed layer: use dedicated slot
+        if (unnamedLayer == null)
+            unnamedLayer = factory("");
+
+        return unnamedLayer;
+    }
+
+    if (!layers.TryGetValue(identifier, out var layer))
+    {
+        layer = factory(identifier);
+        layers.Add(identifier, layer);
+        LayerCreated?.Invoke(layer);
+    }
+
+    return layer;
+    }
+
         {
             if (factory == null)
                 throw new ArgumentNullException(nameof(factory));
 
-            StoryboardLayer layer;
-            var created = false;
+public StoryboardLayer GetLayer(string identifier, Func<string, StoryboardLayer> factory)
+{
+    StoryboardLayer layer;
+    var created = false;
 
-            lock (syncRoot)
+    lock (syncRoot)
+    {
+        if (identifier == null)
+        {
+            // Unnamed layer support
+            if (unnamedLayer == null)
             {
-                if (identifier == null)
-                {
-                    if (unnamedLayer == null)
-                    {
-                        unnamedLayer = factory(null);
-                        if (unnamedLayer == null)
-                            throw new InvalidOperationException("Layer factory returned null for unnamed layer.");
-                        Version++;
-                        created = true;
-                    }
-                    layer = unnamedLayer;
-                }
-                else if (!layers.TryGetValue(identifier, out layer))
-                {
-                    layer = factory(identifier);
-                    if (layer == null)
-                        throw new InvalidOperationException($"Layer factory returned null for identifier '{identifier}'.");
-
-                    layers.Add(identifier, layer);
-                    Version++;
-                    created = true;
-                }
+                unnamedLayer = factory(null);
+                if (unnamedLayer == null)
+                    throw new InvalidOperationException("Layer factory returned null for unnamed layer.");
+                Version++;
+                created = true;
             }
+            layer = unnamedLayer;
+        }
+        else if (!layers.TryGetValue(identifier, out layer))
+        {
+            layer = factory(identifier);
+            if (layer == null)
+                throw new InvalidOperationException($"Layer factory returned null for identifier '{identifier}'.");
 
-            if (created)
-                LayerCreated?.Invoke(layer);
+            layers.Add(identifier, layer);
+            Version++;
+            created = true;
+        }
+    }
 
-            return layer;
+    if (created)
+        LayerCreated?.Invoke(layer);
+
+    return layer;
+}
+
+/// <summary>
+/// Legacy method retained for backward compatibility.
+/// Uses the configured layerFactory, if any, and delegates to the new layered API.
+/// </summary>
+public StoryboardLayer GetLayer(string identifier)
+{
+    if (layerFactory == null)
+        throw new InvalidOperationException(
+            "StoryboardContext requires a layer factory before creating layers in legacy mode.");
+
+    // Forward legacy call to the new implementation
+    return GetLayer(identifier, layerFactory);
+}
+
         }
 
         /// <summary>
-        /// Attempts to retrieve a layer without creating one.
+        /// Attempts to retrieve an existing layer without creating a new one.
+        /// Supports unnamed layers (identifier == null).
         /// </summary>
         public bool TryGetLayer(string identifier, out StoryboardLayer layer)
         {
-            lock (syncRoot)
-            {
-                if (identifier == null)
-                {
-                    layer = unnamedLayer;
-                    return layer != null;
-                }
+          lock (syncRoot)
+          {
+            if (identifier == null)
+              {
+                layer = unnamedLayer;
+                return layer != null;
+              }
 
-                return layers.TryGetValue(identifier, out layer);
-            }
-        }
+          return layers.TryGetValue(identifier, out layer);
+          }
+         }
+
 
         /// <summary>
         /// Returns a snapshot of every layer currently registered with the context.
@@ -100,15 +152,7 @@ namespace StorybrewCommon.Storyboarding
         public IReadOnlyList<StoryboardLayer> SnapshotLayers()
         {
             lock (syncRoot)
-            {
-                if (unnamedLayer == null)
-                    return layers.Values.ToArray();
-
-                var result = new StoryboardLayer[layers.Count + 1];
-                result[0] = unnamedLayer;
-                layers.Values.CopyTo(result, 1);
-                return result;
-            }
+                return layers.Values.ToArray();
         }
 
         /// <summary>

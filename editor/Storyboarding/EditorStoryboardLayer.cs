@@ -97,6 +97,8 @@ namespace StorybrewEditor.Storyboarding
             set => segment.ReverseDepth = value;
         }
 
+        public override IReadOnlyList<StoryboardObject> Objects => segment.Objects;
+
         public bool Highlight;
 
         public int EstimatedSize { get; private set; }

@@ -49,6 +49,7 @@ namespace StorybrewEditor.Storyboarding
                 if (layers.Contains(newLayer))
                 {
                     subscribe(newLayer);
+                    oldLayers.Remove(newLayer);
                     continue;
                 }
 

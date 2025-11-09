@@ -100,6 +100,8 @@ namespace StorybrewEditor.Storyboarding
 
         public LayerManager LayerManager { get; } = new LayerManager();
 
+        private readonly Dictionary<string, SharedStoryboardContextHost> sharedStoryboardContexts = new Dictionary<string, SharedStoryboardContextHost>(StringComparer.Ordinal);
+
         public Project(string projectPath, bool withCommonScripts, ResourceContainer resourceContainer)
         {
             this.projectPath = projectPath;
@@ -147,6 +149,42 @@ namespace StorybrewEditor.Storyboarding
                     if (effect.BeatmapDependant)
                         QueueEffectUpdate(effect);
             };
+        }
+
+        internal StoryboardContext AcquireSharedStoryboardContext(string key, ScriptedEffect effect)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+                throw new ArgumentException("Shared storyboard context key must not be empty", nameof(key));
+            if (effect == null)
+                throw new ArgumentNullException(nameof(effect));
+
+            lock (sharedStoryboardContexts)
+            {
+                if (!sharedStoryboardContexts.TryGetValue(key, out var host))
+                {
+                    host = new SharedStoryboardContextHost(new StoryboardContext());
+                    sharedStoryboardContexts.Add(key, host);
+                }
+
+                host.Register(effect);
+                return host.Context;
+            }
+        }
+
+        internal void ReleaseSharedStoryboardContext(string key, ScriptedEffect effect)
+        {
+            if (string.IsNullOrWhiteSpace(key) || effect == null)
+                return;
+
+            lock (sharedStoryboardContexts)
+            {
+                if (!sharedStoryboardContexts.TryGetValue(key, out var host))
+                    return;
+
+                host.Unregister(effect);
+                if (!host.HasParticipants)
+                    sharedStoryboardContexts.Remove(key);
+            }
         }
 
         #region Audio and Display
@@ -996,6 +1034,30 @@ namespace StorybrewEditor.Storyboarding
 
         #endregion
 
+        private sealed class SharedStoryboardContextHost
+        {
+            public SharedStoryboardContextHost(StoryboardContext context)
+            {
+                Context = context ?? throw new ArgumentNullException(nameof(context));
+            }
+
+            public StoryboardContext Context { get; }
+
+            private readonly HashSet<Guid> participants = new HashSet<Guid>();
+
+            public void Register(ScriptedEffect effect)
+            {
+                participants.Add(effect.Guid);
+            }
+
+            public void Unregister(ScriptedEffect effect)
+            {
+                participants.Remove(effect.Guid);
+            }
+
+            public bool HasParticipants => participants.Count > 0;
+        }
+
         #region IDisposable Support
 
         public bool IsDisposed { get; private set; } = false;
@@ -1014,6 +1076,9 @@ namespace StorybrewEditor.Storyboarding
                     scriptManager.Dispose();
                     TextureContainer.Dispose();
                     AudioContainer.Dispose();
+
+                    lock (sharedStoryboardContexts)
+                        sharedStoryboardContexts.Clear();
                 }
                 assetWatcher = null;
                 MapsetManager = null;

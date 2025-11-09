@@ -41,6 +41,17 @@ namespace StorybrewCommon.Scripting
         /// </summary>
         public StoryboardLayer GetLayer(string identifier) => context.GetLayer(identifier);
 
+        /// <summary>
+        /// Provides access to the active storyboard context when shared contexts are enabled.
+        /// </summary>
+        public StoryboardContext StoryboardContext => context.StoryboardContext;
+
+        /// <summary>
+        /// Enumerates layers known to the generator. When <paramref name="snapshot"/> is true a stable copy is returned.
+        /// </summary>
+        public IEnumerable<StoryboardLayer> EnumerateLayers(bool snapshot = false)
+            => context.EnumerateLayers(snapshot);
+
         public Beatmap Beatmap => context.Beatmap;
         public Beatmap GetBeatmap(string name)
             => context.Beatmaps.FirstOrDefault(b => b.Name == name);

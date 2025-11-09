@@ -49,5 +49,17 @@ namespace StorybrewCommon.Storyboarding
         public abstract OsbSample CreateSample(string path, double time, double volume = 100);
 
         public abstract void Discard(StoryboardObject storyboardObject);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static IReadOnlyList<StoryboardObject> snapshotList(IReadOnlyList<StoryboardObject> source)
+        {
+            if (source == null || source.Count == 0)
+                return Array.Empty<StoryboardObject>();
+
+            var copy = new StoryboardObject[source.Count];
+            for (var i = 0; i < copy.Length; i++)
+                copy[i] = source[i];
+            return copy;
+        }
     }
 }

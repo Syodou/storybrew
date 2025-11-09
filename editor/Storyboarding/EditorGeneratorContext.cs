@@ -6,6 +6,7 @@ using StorybrewEditor.Util;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 
@@ -66,10 +67,14 @@ namespace StorybrewEditor.Storyboarding
 
         public List<EditorStoryboardLayer> EditorLayers = new List<EditorStoryboardLayer>();
 
-        public EditorGeneratorContext(Effect effect, 
-            string projectPath, string projectAssetPath, string mapsetPath, 
-            EditorBeatmap beatmap, IEnumerable<EditorBeatmap> beatmaps, 
-            CancellationToken cancellationToken, MultiFileWatcher watcher)
+        private readonly Dictionary<string, EditorStoryboardLayer> layersByIdentifier = new Dictionary<string, EditorStoryboardLayer>(StringComparer.Ordinal);
+        private EditorStoryboardLayer unnamedLayer;
+
+        public EditorGeneratorContext(Effect effect,
+            string projectPath, string projectAssetPath, string mapsetPath,
+            EditorBeatmap beatmap, IEnumerable<EditorBeatmap> beatmaps,
+            CancellationToken cancellationToken, MultiFileWatcher watcher,
+            StoryboardContext storyboardContext = null)
         {
             this.projectPath = projectPath;
             this.projectAssetPath = projectAssetPath;
@@ -79,12 +84,62 @@ namespace StorybrewEditor.Storyboarding
             this.beatmaps = beatmaps;
             this.cncellationToken = cancellationToken;
             this.watcher = watcher;
+
+            StoryboardContext = storyboardContext;
+
+            if (StoryboardContext != null)
+            {
+                foreach (var layer in StoryboardContext.SnapshotLayers().OfType<EditorStoryboardLayer>())
+                    registerLayer(layer);
+            }
         }
 
-        public override StoryboardLayer GetLayer(string identifier)
+        protected override StoryboardLayer GetOrCreateLayer(string identifier)
         {
-            var layer = EditorLayers.Find(l => l.Identifier == identifier);
-            if (layer == null) EditorLayers.Add(layer = new EditorStoryboardLayer(identifier, effect));
+            if (identifier == null)
+            {
+                if (unnamedLayer == null)
+                    unnamedLayer = registerLayer(new EditorStoryboardLayer(identifier, effect));
+                return unnamedLayer;
+            }
+
+            if (!layersByIdentifier.TryGetValue(identifier, out var layer))
+            {
+                layer = registerLayer(new EditorStoryboardLayer(identifier, effect));
+                layersByIdentifier.Add(identifier, layer);
+            }
+            return layer;
+        }
+
+        protected override IEnumerable<StoryboardLayer> EnumerateLocalLayers()
+            => EditorLayers;
+
+        protected override void OnLayerCreated(StoryboardLayer layer)
+        {
+            if (layer is EditorStoryboardLayer editorLayer)
+                registerLayer(editorLayer);
+        }
+
+        protected override void OnLayerAccessed(StoryboardLayer layer)
+        {
+            if (layer is EditorStoryboardLayer editorLayer)
+                registerLayer(editorLayer);
+        }
+
+        private EditorStoryboardLayer registerLayer(EditorStoryboardLayer layer)
+        {
+            if (layer == null)
+                return null;
+
+            if (layer.Identifier != null && !layersByIdentifier.ContainsKey(layer.Identifier))
+                layersByIdentifier.Add(layer.Identifier, layer);
+
+            if (!EditorLayers.Contains(layer))
+                EditorLayers.Add(layer);
+
+            if (layer.Identifier == null)
+                unnamedLayer ??= layer;
+
             return layer;
         }
 

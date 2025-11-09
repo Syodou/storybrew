@@ -4,6 +4,7 @@ using StorybrewEditor.Util;
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Threading;
 
 namespace StorybrewEditor.Storyboarding
@@ -15,6 +16,8 @@ namespace StorybrewEditor.Storyboarding
         private readonly Stopwatch statusStopwatch = new Stopwatch();
         private string configScriptIdentifier;
         private MultiFileWatcher dependencyWatcher;
+
+        private string sharedContextKey;
 
         public override string BaseName => scriptContainer?.Name;
         public override string Path => scriptContainer?.MainSourcePath;
@@ -57,10 +60,7 @@ namespace StorybrewEditor.Storyboarding
                 Refresh();
             };
 
-            var context = new EditorGeneratorContext(this,
-                Project.ProjectFolderPath, Project.ProjectAssetFolderPath,
-                Project.MapsetPath, Project.MainBeatmap, Project.MapsetManager.Beatmaps,
-                cancellationTokenSource.Token, newDependencyWatcher);
+            EditorGeneratorContext context = null;
             var success = false;
             try
             {
@@ -70,6 +70,30 @@ namespace StorybrewEditor.Storyboarding
 
                 changeStatus(EffectStatus.Loading);
                 var script = scriptContainer.CreateScript();
+
+                var sharedContextAttribute = script.GetType().GetCustomAttribute<SharedStoryboardContextAttribute>();
+                var newSharedContextKey = sharedContextAttribute != null ?
+                    (sharedContextAttribute.Key ?? script.GetType().FullName) :
+                    null;
+
+                if (!string.Equals(sharedContextKey, newSharedContextKey, StringComparison.Ordinal))
+                {
+                    if (sharedContextKey != null)
+                        Project.ReleaseSharedStoryboardContext(sharedContextKey, this);
+                    sharedContextKey = null;
+                }
+
+                var storyboardContext = newSharedContextKey != null ?
+                    Project.AcquireSharedStoryboardContext(newSharedContextKey, this) :
+                    null;
+
+                if (newSharedContextKey != null)
+                    sharedContextKey = newSharedContextKey;
+
+                context = new EditorGeneratorContext(this,
+                    Project.ProjectFolderPath, Project.ProjectAssetFolderPath,
+                    Project.MapsetPath, Project.MainBeatmap, Project.MapsetManager.Beatmaps,
+                    cancellationTokenSource.Token, newDependencyWatcher, storyboardContext);
 
                 cancellationTokenSource.Token.ThrowIfCancellationRequested();
 
@@ -102,13 +126,13 @@ namespace StorybrewEditor.Storyboarding
             catch (ScriptCompilationException e)
             {
                 Debug.Print($"Script compilation failed for {BaseName}\n{e.Message}");
-                changeStatus(EffectStatus.CompilationFailed, e.Message, context.Log);
+                changeStatus(EffectStatus.CompilationFailed, e.Message, context?.Log ?? string.Empty);
                 return;
             }
             catch (ScriptLoadingException e)
             {
                 Debug.Print($"Script load failed for {BaseName}\n{e}");
-                changeStatus(EffectStatus.LoadingFailed, e.InnerException != null ? $"{e.Message}: {e.InnerException.Message}" : e.Message, context.Log);
+                changeStatus(EffectStatus.LoadingFailed, e.InnerException != null ? $"{e.Message}: {e.InnerException.Message}" : e.Message, context?.Log ?? string.Empty);
                 return;
             }
             catch (Exception e)
@@ -130,7 +154,7 @@ namespace StorybrewEditor.Storyboarding
                     depth++;
                 }
 
-                changeStatus(EffectStatus.ExecutionFailed, getExecutionFailedMessage(e), context.Log);
+                changeStatus(EffectStatus.ExecutionFailed, getExecutionFailedMessage(e), context?.Log ?? string.Empty);
                 return;
             }
             finally
@@ -145,12 +169,18 @@ namespace StorybrewEditor.Storyboarding
                     }
                     else dependencyWatcher = newDependencyWatcher;
                 }
-                context.DisposeResources();
+                context?.DisposeResources();
             }
-            changeStatus(EffectStatus.Ready, null, context.Log);
+            changeStatus(EffectStatus.Ready, null, context?.Log ?? string.Empty);
 
             Program.Schedule(() =>
             {
+                if (context == null)
+                {
+                    newDependencyWatcher.Dispose();
+                    return;
+                }
+
                 if (IsDisposed)
                 {
                     newDependencyWatcher.Dispose();
@@ -227,6 +257,12 @@ namespace StorybrewEditor.Storyboarding
             {
                 if (disposing)
                 {
+                    if (sharedContextKey != null)
+                    {
+                        Project.ReleaseSharedStoryboardContext(sharedContextKey, this);
+                        sharedContextKey = null;
+                    }
+
                     dependencyWatcher?.Dispose();
                     scriptContainer.OnScriptChanged -= scriptContainer_OnScriptChanged;
                 }

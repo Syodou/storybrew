@@ -178,6 +178,8 @@ namespace StorybrewEditor.Storyboarding
             foreach (var audioStream in fftAudioStreams.Values)
                 audioStream.Dispose();
             fftAudioStreams = null;
+
+            StoryboardContext = null;
         }
     }
 }

@@ -183,7 +183,10 @@ namespace StorybrewEditor.Storyboarding
 
                 host.Unregister(effect);
                 if (!host.HasParticipants)
+                {
+                    host.Context.Reset();
                     sharedStoryboardContexts.Remove(key);
+                }
             }
         }
 

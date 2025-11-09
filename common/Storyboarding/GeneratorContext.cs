@@ -30,21 +30,22 @@ namespace StorybrewCommon.Storyboarding
         /// </summary>
         public virtual StoryboardLayer GetLayer(string identifier)
         {
-            if (identifier == null)
-                throw new ArgumentNullException(nameof(identifier));
-
             StoryboardLayer layer;
             if (StoryboardContext != null)
             {
-                StoryboardContext.AttachLayerFactory(CreateLayerForContext);
-                layer = StoryboardContext.GetLayer(identifier);
+               // Using shared storyboard context
+               StoryboardContext.AttachLayerFactory(CreateLayerForContext);
+               layer = StoryboardContext.GetLayer(identifier, CreateLayerForContext);
             }
-            else layer = GetOrCreateLayer(identifier);
+            else
+            {
+                // Legacy fallback
+                layer = GetOrCreateLayer(identifier);
+            }
 
             OnLayerAccessed(layer);
             return layer;
         }
-
         /// <summary>
         /// Returns true when this context uses a shared storyboard context between generators.
         /// </summary>

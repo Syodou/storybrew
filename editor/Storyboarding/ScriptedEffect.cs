@@ -1,4 +1,5 @@
 ﻿using StorybrewCommon.Scripting;
+using StorybrewCommon.Storyboarding;
 using StorybrewEditor.Scripting;
 using StorybrewEditor.Util;
 using System;

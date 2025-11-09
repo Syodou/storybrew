@@ -32,20 +32,13 @@ namespace StorybrewCommon.Storyboarding
         {
             StoryboardLayer layer;
             if (StoryboardContext != null)
-            {
-               // Using shared storyboard context
-               StoryboardContext.AttachLayerFactory(CreateLayerForContext);
-               layer = StoryboardContext.GetLayer(identifier, CreateLayerForContext);
-            }
-            else
-            {
-                // Legacy fallback
-                layer = GetOrCreateLayer(identifier);
-            }
+                layer = StoryboardContext.GetLayer(identifier, CreateLayerForContext);
+            else layer = GetOrCreateLayer(identifier);
 
             OnLayerAccessed(layer);
             return layer;
         }
+
         /// <summary>
         /// Returns true when this context uses a shared storyboard context between generators.
         /// </summary>
@@ -69,10 +62,7 @@ namespace StorybrewCommon.Storyboarding
                 storyboardContext = value;
 
                 if (storyboardContext != null)
-                {
-                    storyboardContext.AttachLayerFactory(CreateLayerForContext);
                     storyboardContext.LayerCreated += layerCreatedHandler;
-                }
             }
         }
 

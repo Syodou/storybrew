@@ -46,6 +46,13 @@ namespace StorybrewEditor.Storyboarding
             oldLayers = new List<EditorStoryboardLayer>(oldLayers);
             foreach (var newLayer in newLayers)
             {
+                if (layers.Contains(newLayer))
+                {
+                    subscribe(newLayer);
+                    oldLayers.Remove(newLayer);
+                    continue;
+                }
+
                 var oldLayer = oldLayers.Find(l => l.Identifier == newLayer.Identifier);
                 if (oldLayer != null)
                 {
@@ -58,13 +65,16 @@ namespace StorybrewEditor.Storyboarding
                     oldLayers.Remove(oldLayer);
                 }
                 else layers.Insert(findLayerIndex(newLayer), newLayer);
+
                 subscribe(newLayer);
             }
+
             foreach (var oldLayer in oldLayers)
             {
                 unsubscribe(oldLayer);
                 layers.Remove(oldLayer);
             }
+
             OnLayersChanged?.Invoke(this, EventArgs.Empty);
         }
 
@@ -73,17 +83,25 @@ namespace StorybrewEditor.Storyboarding
             var index = layers.IndexOf(oldLayer);
             if (index != -1)
             {
+                var insertionIndex = index;
                 foreach (var newLayer in newLayers)
                 {
+                    if (layers.Contains(newLayer))
+                    {
+                        subscribe(newLayer);
+                        continue;
+                    }
+
                     newLayer.CopySettings(oldLayer, copyGuid: false);
                     subscribe(newLayer);
+                    layers.Insert(insertionIndex++, newLayer);
                 }
-                layers.InsertRange(index, newLayers);
 
                 unsubscribe(oldLayer);
                 layers.Remove(oldLayer);
             }
             else throw new InvalidOperationException($"Cannot replace layer '{oldLayer.Name}' with multiple layers, old layer not found");
+
             OnLayersChanged?.Invoke(this, EventArgs.Empty);
         }
 

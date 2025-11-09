@@ -48,7 +48,10 @@ namespace StorybrewEditor.Storyboarding
             if (newLayers == null)
                 throw new ArgumentNullException(nameof(newLayers));
 
-            var cleanup = new List<EditorStoryboardLayer>(oldLayers);
+            if (oldLayers.Count == 0 && newLayers.Count == 0)
+                return;
+
+            var cleanup = new HashSet<EditorStoryboardLayer>(oldLayers);
             foreach (var newLayer in newLayers)
             {
                 if (newLayer == null)
@@ -61,19 +64,19 @@ namespace StorybrewEditor.Storyboarding
                     continue;
                 }
 
-                var oldLayer = cleanup.Find(l => l.Identifier == newLayer.Identifier);
-                if (oldLayer != null)
+                var matchingOldLayer = findMatchingLayer(cleanup, newLayer.Identifier);
+                if (matchingOldLayer != null)
                 {
-                    var index = layers.IndexOf(oldLayer);
+                    var index = layers.IndexOf(matchingOldLayer);
                     if (index != -1)
                     {
-                        unsubscribe(oldLayer);
-                        newLayer.CopySettings(oldLayer, copyGuid: true);
+                        unsubscribe(matchingOldLayer);
+                        newLayer.CopySettings(matchingOldLayer, copyGuid: true);
                         layers[index] = newLayer;
                         subscribe(newLayer);
                     }
 
-                    cleanup.Remove(oldLayer);
+                    cleanup.Remove(matchingOldLayer);
                     continue;
                 }
 
@@ -88,6 +91,21 @@ namespace StorybrewEditor.Storyboarding
             }
 
             OnLayersChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        // Identifier matching intentionally stays in-memory so tests do not trigger filesystem lookups
+        // while reconciling placeholder layers.
+        private static EditorStoryboardLayer findMatchingLayer(HashSet<EditorStoryboardLayer> candidates, string identifier)
+        {
+            if (candidates.Count == 0)
+                return null;
+
+            foreach (var candidate in candidates)
+            {
+                if (candidate.Identifier == identifier)
+                    return candidate;
+            }
+            return null;
         }
 
         public void Replace(EditorStoryboardLayer oldLayer, List<EditorStoryboardLayer> newLayers)

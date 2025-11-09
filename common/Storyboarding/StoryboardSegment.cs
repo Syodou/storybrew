@@ -1,4 +1,6 @@
 ﻿using OpenTK;
+using System;
+using System.Collections.Generic;
 
 namespace StorybrewCommon.Storyboarding
 {
@@ -17,6 +19,22 @@ namespace StorybrewCommon.Storyboarding
         public abstract double Scale { get; set; }
 
         public abstract bool ReverseDepth { get; set; }
+
+        /// <summary>
+        /// Provides a read-only view of the storyboard objects that belong directly to this segment.
+        /// The collection reflects new additions while preventing external modifications to the internal list.
+        /// </summary>
+        public virtual IReadOnlyList<StoryboardObject> Objects => Array.Empty<StoryboardObject>();
+
+        /// <summary>
+        /// Enumerates the objects in this segment that match the requested storyboard object type.
+        /// </summary>
+        public IEnumerable<TStoryboardObject> ObjectsOfType<TStoryboardObject>() where TStoryboardObject : StoryboardObject
+        {
+            foreach (var storyboardObject in Objects)
+                if (storyboardObject is TStoryboardObject typedObject)
+                    yield return typedObject;
+        }
 
         public abstract IEnumerable<StoryboardSegment> NamedSegments { get; }
         public abstract StoryboardSegment CreateSegment(string identifier = null);

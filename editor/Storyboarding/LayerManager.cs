@@ -12,6 +12,7 @@ namespace StorybrewEditor.Storyboarding
     public class LayerManager
     {
         private readonly List<EditorStoryboardLayer> layers = new List<EditorStoryboardLayer>();
+        private readonly HashSet<EditorStoryboardLayer> subscribedLayers = new HashSet<EditorStoryboardLayer>();
 
         public int LayersCount => layers.Count;
         public IEnumerable<EditorStoryboardLayer> Layers => layers;
@@ -22,7 +23,7 @@ namespace StorybrewEditor.Storyboarding
         public void Add(EditorStoryboardLayer layer)
         {
             layers.Insert(findLayerIndex(layer), layer);
-            layer.OnChanged += layer_OnChanged;
+            subscribe(layer);
             OnLayersChanged?.Invoke(this, EventArgs.Empty);
         }
 
@@ -32,8 +33,8 @@ namespace StorybrewEditor.Storyboarding
             if (index != -1)
             {
                 newLayer.CopySettings(oldLayer, copyGuid: true);
-                newLayer.OnChanged += layer_OnChanged;
-                oldLayer.OnChanged -= layer_OnChanged;
+                subscribe(newLayer);
+                unsubscribe(oldLayer);
                 layers[index] = newLayer;
             }
             else throw new InvalidOperationException($"Cannot replace layer '{oldLayer.Name}' with '{newLayer.Name}', old layer not found");
@@ -42,28 +43,50 @@ namespace StorybrewEditor.Storyboarding
 
         public void Replace(List<EditorStoryboardLayer> oldLayers, List<EditorStoryboardLayer> newLayers)
         {
-            oldLayers = new List<EditorStoryboardLayer>(oldLayers);
+            if (oldLayers == null)
+                throw new ArgumentNullException(nameof(oldLayers));
+            if (newLayers == null)
+                throw new ArgumentNullException(nameof(newLayers));
+
+            var cleanup = new List<EditorStoryboardLayer>(oldLayers);
             foreach (var newLayer in newLayers)
             {
-                var oldLayer = oldLayers.Find(l => l.Identifier == newLayer.Identifier);
+                if (newLayer == null)
+                    continue;
+
+                if (layers.Contains(newLayer))
+                {
+                    subscribe(newLayer);
+                    cleanup.Remove(newLayer);
+                    continue;
+                }
+
+                var oldLayer = cleanup.Find(l => l.Identifier == newLayer.Identifier);
                 if (oldLayer != null)
                 {
                     var index = layers.IndexOf(oldLayer);
                     if (index != -1)
                     {
-                        newLayer.CopySettings(layers[index], copyGuid: true);
+                        unsubscribe(oldLayer);
+                        newLayer.CopySettings(oldLayer, copyGuid: true);
                         layers[index] = newLayer;
+                        subscribe(newLayer);
                     }
-                    oldLayers.Remove(oldLayer);
+
+                    cleanup.Remove(oldLayer);
+                    continue;
                 }
-                else layers.Insert(findLayerIndex(newLayer), newLayer);
-                newLayer.OnChanged += layer_OnChanged;
+
+                layers.Insert(findLayerIndex(newLayer), newLayer);
+                subscribe(newLayer);
             }
-            foreach (var oldLayer in oldLayers)
+
+            foreach (var oldLayer in cleanup)
             {
-                oldLayer.OnChanged -= layer_OnChanged;
+                unsubscribe(oldLayer);
                 layers.Remove(oldLayer);
             }
+
             OnLayersChanged?.Invoke(this, EventArgs.Empty);
         }
 
@@ -72,17 +95,25 @@ namespace StorybrewEditor.Storyboarding
             var index = layers.IndexOf(oldLayer);
             if (index != -1)
             {
+                var insertionIndex = index;
                 foreach (var newLayer in newLayers)
                 {
-                    newLayer.CopySettings(oldLayer, copyGuid: false);
-                    newLayer.OnChanged += layer_OnChanged;
-                }
-                layers.InsertRange(index, newLayers);
+                    if (layers.Contains(newLayer))
+                    {
+                        subscribe(newLayer);
+                        continue;
+                    }
 
-                oldLayer.OnChanged -= layer_OnChanged;
+                    newLayer.CopySettings(oldLayer, copyGuid: false);
+                    subscribe(newLayer);
+                    layers.Insert(insertionIndex++, newLayer);
+                }
+
+                unsubscribe(oldLayer);
                 layers.Remove(oldLayer);
             }
             else throw new InvalidOperationException($"Cannot replace layer '{oldLayer.Name}' with multiple layers, old layer not found");
+
             OnLayersChanged?.Invoke(this, EventArgs.Empty);
         }
 
@@ -90,7 +121,7 @@ namespace StorybrewEditor.Storyboarding
         {
             if (layers.Remove(layer))
             {
-                layer.OnChanged -= layer_OnChanged;
+                unsubscribe(layer);
                 OnLayersChanged?.Invoke(this, EventArgs.Empty);
             }
         }
@@ -189,6 +220,24 @@ namespace StorybrewEditor.Storyboarding
                 sortLayer(layerToMove);
             }
             else throw new InvalidOperationException($"Cannot move layer '{layerToMove.Name}' to the position of '{layerToMove.Name}'");
+        }
+
+        private void subscribe(EditorStoryboardLayer layer)
+        {
+            if (layer == null)
+                return;
+
+            if (subscribedLayers.Add(layer))
+                layer.OnChanged += layer_OnChanged;
+        }
+
+        private void unsubscribe(EditorStoryboardLayer layer)
+        {
+            if (layer == null)
+                return;
+
+            if (subscribedLayers.Remove(layer))
+                layer.OnChanged -= layer_OnChanged;
         }
 
         public void TriggerEvents(double startTime, double endTime)

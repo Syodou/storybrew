@@ -43,33 +43,45 @@ namespace StorybrewEditor.Storyboarding
 
         public void Replace(List<EditorStoryboardLayer> oldLayers, List<EditorStoryboardLayer> newLayers)
         {
-            oldLayers = new List<EditorStoryboardLayer>(oldLayers);
+            if (oldLayers == null)
+                throw new ArgumentNullException(nameof(oldLayers));
+            if (newLayers == null)
+                throw new ArgumentNullException(nameof(newLayers));
+
+            var cleanup = new List<EditorStoryboardLayer>(oldLayers);
             foreach (var newLayer in newLayers)
             {
+                if (newLayer == null)
+                    continue;
+
                 if (layers.Contains(newLayer))
                 {
                     subscribe(newLayer);
-                    oldLayers.Remove(newLayer);
+                    cleanup.Remove(newLayer);
                     continue;
                 }
 
-                var oldLayer = oldLayers.Find(l => l.Identifier == newLayer.Identifier);
+                var oldLayer = cleanup.Find(l => l.Identifier == newLayer.Identifier);
                 if (oldLayer != null)
                 {
                     var index = layers.IndexOf(oldLayer);
                     if (index != -1)
                     {
-                        newLayer.CopySettings(layers[index], copyGuid: true);
+                        unsubscribe(oldLayer);
+                        newLayer.CopySettings(oldLayer, copyGuid: true);
                         layers[index] = newLayer;
+                        subscribe(newLayer);
                     }
-                    oldLayers.Remove(oldLayer);
-                }
-                else layers.Insert(findLayerIndex(newLayer), newLayer);
 
+                    cleanup.Remove(oldLayer);
+                    continue;
+                }
+
+                layers.Insert(findLayerIndex(newLayer), newLayer);
                 subscribe(newLayer);
             }
 
-            foreach (var oldLayer in oldLayers)
+            foreach (var oldLayer in cleanup)
             {
                 unsubscribe(oldLayer);
                 layers.Remove(oldLayer);

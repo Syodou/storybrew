@@ -228,10 +228,15 @@ namespace StorybrewEditor.Storyboarding
 
         private void applyCommandOrdering()
         {
-            if (!CommandCoordinator.TryBuildOrdered(segment.RawObjects, out var ordered))
-                return;
+            var rawObjects = segment.RawObjects;
 
-            segment.ReorderObjects(ordered);
+            if (CommandCoordinator.TryBuildOrdered(rawObjects, out var ordered))
+            {
+                segment.ReorderObjects(ordered);
+                rawObjects = segment.RawObjects;
+            }
+
+            CommandCoordinator.MergeCommands(rawObjects);
         }
     }
 }

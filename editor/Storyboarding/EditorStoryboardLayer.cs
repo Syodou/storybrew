@@ -114,6 +114,8 @@ namespace StorybrewEditor.Storyboarding
         public EditorStoryboardLayer(string identifier, Effect effect) : base(identifier)
         {
             Effect = effect;
+            if (effect != null)
+                CommandCoordinator.RegisterContributor(effect.Guid, effect.Name);
             segment = new EditorStoryboardSegment(effect, this, "Root");
         }
 
@@ -157,7 +159,7 @@ namespace StorybrewEditor.Storyboarding
 
         public void PostProcess(CancellationToken token)
         {
-            commandAggregator.ApplyOrdering(segment);
+            applyCommandOrdering();
             segment.PostProcess();
 
             startTime = segment.StartTime;
@@ -173,13 +175,13 @@ namespace StorybrewEditor.Storyboarding
 
         public void WriteOsb(TextWriter writer, ExportSettings exportSettings, CancellationToken token = default)
         {
-            commandAggregator.ApplyOrdering(segment);
+            applyCommandOrdering();
             segment.WriteOsb(writer, exportSettings, osbLayer, null, token);
         }
 
         public override void WriteOsb(TextWriter writer, ExportSettings exportSettings, OsbLayer layer, StoryboardTransform transform, CancellationToken token = default)
         {
-            commandAggregator.ApplyOrdering(segment);
+            applyCommandOrdering();
             segment.WriteOsb(writer, exportSettings, osbLayer, transform, token);
         }
 
@@ -202,20 +204,34 @@ namespace StorybrewEditor.Storyboarding
         public override string ToString() => $"name:{name}, id:{Identifier}, layer:{osbLayer}, diffSpec:{diffSpecific}";
 
         internal void NotifyObjectCreated(StoryboardObject storyboardObject)
-            => commandAggregator.TrackObject(storyboardObject);
+        {
+            var contributor = EditorGeneratorContext.Current?.Effect ?? Effect;
+            if (contributor != null)
+                CommandCoordinator.RegisterContributor(contributor.Guid, contributor.Name);
+
+            CommandCoordinator.Track(storyboardObject, contributor?.Guid ?? Guid.Empty);
+        }
 
         internal void NotifyObjectDiscarded(StoryboardObject storyboardObject)
-            => commandAggregator.UntrackObject(storyboardObject);
+            => CommandCoordinator.Untrack(storyboardObject);
 
         internal void RegisterContributor(Effect contributor)
         {
             if (contributor == null)
                 return;
 
-            commandAggregator.RegisterContributor(contributor);
+            CommandCoordinator.RegisterContributor(contributor.Guid, contributor.Name);
         }
 
         public void SetContributorPriority(Guid contributorId, int priority)
-            => commandAggregator.SetContributorPriority(contributorId, priority);
+            => CommandCoordinator.UpdateContributorPriority(contributorId, priority);
+
+        private void applyCommandOrdering()
+        {
+            if (!CommandCoordinator.TryBuildOrdered(segment.RawObjects, out var ordered))
+                return;
+
+            segment.ReorderObjects(ordered);
+        }
     }
 }

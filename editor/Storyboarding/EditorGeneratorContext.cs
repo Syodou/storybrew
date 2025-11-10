@@ -14,6 +14,10 @@ namespace StorybrewEditor.Storyboarding
 {
     public class EditorGeneratorContext : GeneratorContext
     {
+        private static readonly AsyncLocal<EditorGeneratorContext> activeContext = new AsyncLocal<EditorGeneratorContext>();
+
+        public static EditorGeneratorContext Current => activeContext.Value;
+
         private readonly Effect effect;
         private readonly MultiFileWatcher watcher;
 
@@ -72,6 +76,8 @@ namespace StorybrewEditor.Storyboarding
 
         private EditorStoryboardLayer unnamedLayer;
 
+        internal Effect Effect => effect;
+
         public EditorGeneratorContext(Effect effect,
             string projectPath, string projectAssetPath, string mapsetPath,
             EditorBeatmap beatmap, IEnumerable<EditorBeatmap> beatmaps,
@@ -108,7 +114,10 @@ namespace StorybrewEditor.Storyboarding
 
             // Already exists?
             if (layersByIdentifier.TryGetValue(identifier, out var existing))
+            {
+                existing.RegisterContributor(effect);
                 return existing;
+            }
 
             // Create new layer
             var layer = new EditorStoryboardLayer(identifier, effect);
@@ -118,6 +127,8 @@ namespace StorybrewEditor.Storyboarding
 
             // Bind cache
             layersByIdentifier[identifier] = layer;
+
+            layer.RegisterContributor(effect);
 
             return layer;
         }
@@ -141,9 +152,11 @@ namespace StorybrewEditor.Storyboarding
         // ✅ Ensures shared-context created layers sync with editor cache
         internal void RebindLayer(string identifier, StoryboardLayer layer)
         {
-            layersByIdentifier[identifier ?? ""] = (EditorStoryboardLayer)layer;
-            if (!EditorLayers.Contains(layer))
-                EditorLayers.Add((EditorStoryboardLayer)layer);
+            var editorLayer = (EditorStoryboardLayer)layer;
+
+            indexLayer(editorLayer);
+
+            editorLayer.RegisterContributor(effect);
         }
 
         // ✅ Clean, guaranteed-unique register
@@ -152,20 +165,81 @@ namespace StorybrewEditor.Storyboarding
             if (layer == null)
                 return null;
 
-            var key = layer.Identifier ?? "";
+            indexLayer(layer);
 
-            // Always bind latest instance
-            layersByIdentifier[key] = layer;
-
-            // Ensure global tracking
-            if (!EditorLayers.Contains(layer))
-                EditorLayers.Add(layer);
-
-            // Assign unnamed layer
-            if (layer.Identifier == null)
-                unnamedLayer ??= layer;
+            layer.RegisterContributor(effect);
 
             return layer;
+        }
+
+        private void indexLayer(EditorStoryboardLayer layer)
+        {
+            if (layer == null)
+                return;
+
+            var key = layer.Identifier ?? "";
+
+            if (layersByIdentifier.TryGetValue(key, out var previous) && !ReferenceEquals(previous, layer))
+            {
+                replaceEditorLayer(previous, layer);
+            }
+            else if (!EditorLayers.Contains(layer))
+            {
+                EditorLayers.Add(layer);
+            }
+
+            layersByIdentifier[key] = layer;
+
+            if (layer.Identifier == null)
+                unnamedLayer = layer;
+        }
+
+        private void replaceEditorLayer(EditorStoryboardLayer previous, EditorStoryboardLayer replacement)
+        {
+            if (previous == null || replacement == null)
+                return;
+
+            var index = EditorLayers.IndexOf(previous);
+            if (index >= 0)
+                EditorLayers[index] = replacement;
+            else if (!EditorLayers.Contains(replacement))
+                EditorLayers.Add(replacement);
+
+            if (ReferenceEquals(unnamedLayer, previous) && replacement.Identifier == null)
+                unnamedLayer = replacement;
+
+            ensureUniqueEntry(replacement);
+        }
+
+        private void ensureUniqueEntry(EditorStoryboardLayer replacement)
+        {
+            var identifier = replacement.Identifier;
+            var kept = false;
+
+            for (var i = 0; i < EditorLayers.Count; i++)
+            {
+                var candidate = EditorLayers[i];
+                if (!string.Equals(candidate.Identifier, identifier, StringComparison.Ordinal))
+                    continue;
+
+                if (!kept)
+                {
+                    if (!ReferenceEquals(candidate, replacement))
+                        EditorLayers[i] = replacement;
+                    kept = true;
+                    continue;
+                }
+
+                if (!ReferenceEquals(candidate, replacement))
+                {
+                    EditorLayers.RemoveAt(i);
+                    i--;
+                    continue;
+                }
+
+                EditorLayers.RemoveAt(i);
+                i--;
+            }
         }
 
         public override void AddDependency(string path)
@@ -199,11 +273,38 @@ namespace StorybrewEditor.Storyboarding
 
         public void DisposeResources()
         {
-            foreach (var audioStream in fftAudioStreams.Values)
-                audioStream.Dispose();
-            fftAudioStreams = null;
+            if (fftAudioStreams != null)
+            {
+                foreach (var audioStream in fftAudioStreams.Values)
+                    audioStream.Dispose();
+                fftAudioStreams = null;
+            }
 
             StoryboardContext = null;
+        }
+
+        public IDisposable Activate()
+            => new ActivationCookie(this);
+
+        private sealed class ActivationCookie : IDisposable
+        {
+            private readonly EditorGeneratorContext previous;
+            private bool disposed;
+
+            public ActivationCookie(EditorGeneratorContext context)
+            {
+                previous = activeContext.Value;
+                activeContext.Value = context;
+            }
+
+            public void Dispose()
+            {
+                if (disposed)
+                    return;
+
+                activeContext.Value = previous;
+                disposed = true;
+            }
         }
     }
 }

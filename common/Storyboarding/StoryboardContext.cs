@@ -11,6 +11,7 @@ namespace StorybrewCommon.Storyboarding
     public class StoryboardContext
     {
         private readonly Dictionary<string, StoryboardLayer> layers;
+        private readonly List<StoryboardLayer> orderedLayers;
         private readonly object syncRoot = new object();
         private StoryboardLayer unnamedLayer;
 
@@ -22,6 +23,7 @@ namespace StorybrewCommon.Storyboarding
         public StoryboardContext(IEqualityComparer<string> comparer)
         {
             layers = new Dictionary<string, StoryboardLayer>(comparer ?? StringComparer.Ordinal);
+            orderedLayers = new List<StoryboardLayer>();
         }
 
         /// <summary>
@@ -56,6 +58,7 @@ namespace StorybrewCommon.Storyboarding
                             throw new InvalidOperationException("Layer factory returned null for unnamed layer.");
                         Version++;
                         created = true;
+                        orderedLayers.Insert(0, unnamedLayer);
                     }
                     layer = unnamedLayer;
                 }
@@ -66,6 +69,7 @@ namespace StorybrewCommon.Storyboarding
                         throw new InvalidOperationException($"Layer factory returned null for identifier '{identifier}'.");
 
                     layers.Add(identifier, layer);
+                    orderedLayers.Add(layer);
                     Version++;
                     created = true;
                 }
@@ -101,13 +105,10 @@ namespace StorybrewCommon.Storyboarding
         {
             lock (syncRoot)
             {
-                if (unnamedLayer == null)
-                    return layers.Values.ToArray();
+                if (orderedLayers.Count == 0)
+                    return Array.Empty<StoryboardLayer>();
 
-                var result = new StoryboardLayer[layers.Count + 1];
-                result[0] = unnamedLayer;
-                layers.Values.CopyTo(result, 1);
-                return result;
+                return orderedLayers.ToArray();
             }
         }
 
@@ -120,10 +121,7 @@ namespace StorybrewCommon.Storyboarding
             {
                 lock (syncRoot)
                 {
-                    if (unnamedLayer != null)
-                        yield return unnamedLayer;
-
-                    foreach (var layer in layers.Values)
+                    foreach (var layer in orderedLayers)
                         yield return layer;
                 }
                 yield break;
@@ -141,6 +139,7 @@ namespace StorybrewCommon.Storyboarding
             lock (syncRoot)
             {
                 layers.Clear();
+                orderedLayers.Clear();
                 unnamedLayer = null;
                 Version++;
             }

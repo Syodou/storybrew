@@ -1,4 +1,5 @@
 using StorybrewCommon.Storyboarding;
+using System.Linq;
 
 namespace Test
 {
@@ -68,7 +69,8 @@ namespace Test
         [TestMethod]
         public void TestBooleanCommandsInLoop()
         {
-            var loopCount = 3;
+            const int loopCount = 3;
+            const int loopDuration = 300;
 
             var sprite = new OsbSprite();
 
@@ -77,29 +79,40 @@ namespace Test
             sprite.FlipV(100, 300);
             sprite.EndGroup();
 
-            Assert.IsFalse(sprite.FlipHAt(-1000), $"before loops, H");
-            Assert.IsFalse(sprite.FlipVAt(-1000), $"before loops, V");
-            Assert.IsFalse(sprite.FlipHAt(300 * loopCount + 1000), $"after loops, H");
-            Assert.IsFalse(sprite.FlipVAt(300 * loopCount + 1000), $"after loops, V");
+            Assert.IsFalse(sprite.FlipHAt(-1000), "before loops, H");
+            Assert.IsFalse(sprite.FlipVAt(-1000), "before loops, V");
+            Assert.IsFalse(sprite.FlipHAt(loopDuration * loopCount + 1000), "after loops, H");
+            Assert.IsFalse(sprite.FlipVAt(loopDuration * loopCount + 1000), "after loops, V");
 
-            // In/out of commands
-            for (var i = 0; i < loopCount; i++)
+            var indices = Enumerable.Range(0, loopCount).ToArray();
+
+            CollectionAssert.AreEqual(
+                new[] { true, false, false },
+                indices.Select(i => (bool)sprite.FlipHAt(i * loopDuration)).ToArray(),
+                "loop boundary at H start");
+
+            CollectionAssert.AreEqual(
+                new[] { true, true, true },
+                indices.Select(i => (bool)sprite.FlipHAt(i * loopDuration + 200)).ToArray(),
+                "loop boundary at H end");
+
+            CollectionAssert.AreEqual(
+                new[] { true, false, false },
+                indices.Select(i => (bool)sprite.FlipVAt(i * loopDuration + 100)).ToArray(),
+                "loop boundary at V start");
+
+            CollectionAssert.AreEqual(
+                new[] { true, true, true },
+                indices.Select(i => (bool)sprite.FlipVAt(i * loopDuration + 300)).ToArray(),
+                "loop boundary at V end");
+
+            foreach (var i in indices)
             {
-                Assert.IsTrue(sprite.FlipHAt(i * 300 + 100), $"loop {i}, during H");
-                Assert.IsFalse(sprite.FlipHAt(i * 300 + 250), $"loop {i}, after H");
+                Assert.IsTrue(sprite.FlipHAt(i * loopDuration + 100), $"loop {i}, during H");
+                Assert.IsFalse(sprite.FlipHAt(i * loopDuration + 250), $"loop {i}, after H");
 
-                Assert.IsTrue(sprite.FlipVAt(i * 300 + 200), $"loop {i}, during V");
-                Assert.IsFalse(sprite.FlipVAt(i * 300 + 50), $"loop {i}, before V");
-            }
-
-            // At command boundary
-            for (var i = 0; i < loopCount; i++)
-            {
-                Assert.IsTrue(sprite.FlipHAt(i * 300), $"loop {i}, at H start");
-                Assert.IsTrue(sprite.FlipHAt(i * 300 + 200), $"loop {i}, at H end");
-
-                Assert.IsTrue(sprite.FlipVAt(i * 300 + 100), $"loop {i}, at V start");
-                Assert.IsTrue(sprite.FlipVAt(i * 300 + 300), $"loop {i}, at V end");
+                Assert.IsTrue(sprite.FlipVAt(i * loopDuration + 200), $"loop {i}, during V");
+                Assert.IsFalse(sprite.FlipVAt(i * loopDuration + 50), $"loop {i}, before V");
             }
         }
 

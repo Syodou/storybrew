@@ -279,7 +279,8 @@ namespace StorybrewEditor.Storyboarding
         private void sortLayer(EditorStoryboardLayer layer)
         {
             var initialIndex = layers.IndexOf(layer);
-            if (initialIndex < 0) new InvalidOperationException($"Layer '{layer.Name}' cannot be found");
+            if (initialIndex < 0)
+                throw new InvalidOperationException($"Layer '{layer.Name}' cannot be found");
 
             var newIndex = initialIndex;
             while (newIndex > 0 && layer.CompareTo(layers[newIndex - 1]) < 0) newIndex--;

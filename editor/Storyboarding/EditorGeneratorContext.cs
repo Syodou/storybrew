@@ -103,11 +103,11 @@ namespace StorybrewEditor.Storyboarding
                 return unnamedLayer;
             }
 
-            if (!layersByIdentifier.TryGetValue(identifier, out var layer))
-            {
-                layer = registerLayer(new EditorStoryboardLayer(identifier, effect));
-                layersByIdentifier.Add(identifier, layer);
-            }
+            if (layersByIdentifier.TryGetValue(identifier, out var existing))
+                return existing;
+
+            var layer = registerLayer(new EditorStoryboardLayer(identifier, effect));
+            layersByIdentifier[identifier] = layer;
             return layer;
         }
 
@@ -131,8 +131,15 @@ namespace StorybrewEditor.Storyboarding
             if (layer == null)
                 return null;
 
-            if (layer.Identifier != null && !layersByIdentifier.ContainsKey(layer.Identifier))
-                layersByIdentifier.Add(layer.Identifier, layer);
+            if (layer.Identifier != null)
+            {
+                if (layersByIdentifier.TryGetValue(layer.Identifier, out var existing))
+                {
+                    if (!ReferenceEquals(existing, layer))
+                        layersByIdentifier[layer.Identifier] = layer;
+                }
+                else layersByIdentifier.Add(layer.Identifier, layer);
+            }
 
             if (!EditorLayers.Contains(layer))
                 EditorLayers.Add(layer);

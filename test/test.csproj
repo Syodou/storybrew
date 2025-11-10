@@ -9,6 +9,9 @@
     <IsTestProject>true</IsTestProject>
     <AssemblyName>Test</AssemblyName>
     <RootNamespace>Test</RootNamespace>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <UseWindowsForms>true</UseWindowsForms>
+    <PlatformTarget>x86</PlatformTarget>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,7 +22,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\brewlib\brewlib.csproj" />
+    <ProjectReference Include="..\brewlib\brewlib.csproj" Condition="Exists('..\brewlib\brewlib.csproj')" />
     <ProjectReference Include="..\common\common.csproj" />
     <ProjectReference Include="..\editor\editor.csproj" />
   </ItemGroup>

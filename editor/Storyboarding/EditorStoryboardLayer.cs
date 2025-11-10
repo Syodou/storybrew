@@ -28,6 +28,8 @@ namespace StorybrewEditor.Storyboarding
 
         public Effect Effect { get; }
 
+        private readonly LayerCommandAggregator commandAggregator = new LayerCommandAggregator();
+
         private bool visible = true;
         public bool Visible
         {

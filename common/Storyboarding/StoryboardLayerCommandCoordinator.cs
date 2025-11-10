@@ -2,7 +2,6 @@ using StorybrewCommon.Storyboarding.Commands;
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
 using System.Diagnostics;
 
@@ -10,7 +9,12 @@ namespace StorybrewCommon.Storyboarding
 {
     /// <summary>
     /// Coordinates storyboard object contributions collected from multiple scripts before export.
-    /// Maintains per-contributor ordering and deterministically merges command timelines.
+    /// Maintains contributor and object ordering, exposes deterministic fusion of overlapping commands,
+    /// and rebuilds sprite state without mutating the incoming command collections.
+    /// <para>
+    /// Fusion always runs once per layer before editor post-processing/export and never leaks editor-only
+    /// state back into the runtime objects.
+    /// </para>
     /// </summary>
     public sealed class StoryboardLayerCommandCoordinator
     {
@@ -24,8 +28,14 @@ namespace StorybrewCommon.Storyboarding
         private readonly Dictionary<Type, CommandAccessor> commandAccessors = new Dictionary<Type, CommandAccessor>();
         private readonly SpriteStateTracker spriteStateTracker = new SpriteStateTracker();
         private readonly List<CommandFusionResult> fusionResults = new List<CommandFusionResult>();
+        private readonly List<CommandOutput> fusionOutputs = new List<CommandOutput>();
 
         private const double MergeTolerance = 0.0001d;
+
+        /// <summary>
+        /// Canonical command comparer used by legacy callers that do not provide ordering metadata.
+        /// </summary>
+        public static IComparer<ICommand> CommandOrderingComparer { get; } = new FusionCommandComparer();
 
         private static readonly MethodInfo MemberwiseCloneMethod = typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic);
 
@@ -163,6 +173,10 @@ namespace StorybrewCommon.Storyboarding
             }
         }
 
+        /// <summary>
+        /// Replays the sprite state for the supplied storyboard objects and merges supported command types in-place.
+        /// Invoked once per layer before editor post-processing/export to ensure the runtime objects stay in sync.
+        /// </summary>
         public IReadOnlyList<CommandFusionResult> MergeCommands(IReadOnlyList<StoryboardObject> objects)
         {
             if (objects == null || objects.Count == 0)
@@ -184,35 +198,82 @@ namespace StorybrewCommon.Storyboarding
             return results;
         }
 
+        /// <summary>
+        /// Fuses overlapping or contiguous commands while keeping unrelated commands intact.
+        /// Always returns freshly cloned command instances ordered deterministically.
+        /// </summary>
+        /// <remarks>
+        /// Fusion obeys layer object ordering, command type sorting, timeline order, and contributor metadata.
+        /// The result never mutates the incoming commands and can safely be re-fused without changing its shape.
+        /// Runs in both the editor and export pipeline once per layer immediately before serialization.
+        /// Each invocation is scoped to a single storyboard object, preserving cross-object isolation.
+        /// </remarks>
         public IReadOnlyList<ICommand> FuseCommands(IEnumerable<ICommand> commands)
+            => FuseCommands(commands, FusionOrderingContext.Default);
+
+        internal IReadOnlyList<ICommand> FuseCommands(IEnumerable<ICommand> commands, FusionOrderingContext context)
         {
+            // Fusion pipeline summary:
+            //  1. Clone every incoming command to keep the call side immutable.
+            //  2. Group commands per storyboard object & type (context scopes to a single storyboard object) and sort by time.
+            //  3. Merge only overlapping or edge-touching segments with matching command types.
+            //  4. Prefer the earliest easing when conflicts arise; unrelated commands keep their order untouched.
+            //  5. Produce a deterministic ordering using object order, type, start, end, and contributor metadata.
             if (commands == null)
                 return Array.Empty<ICommand>();
 
-            var enumerated = new List<ICommand>();
-            foreach (var command in commands)
+            fusionOutputs.Clear();
+
+            var recordsByType = buildCommandRecords(commands, context);
+            var anyMerged = false;
+
+            if (recordsByType != null)
             {
-                if (command != null)
-                    enumerated.Add(command);
+                foreach (var typeRecords in recordsByType.Values)
+                    processCommandTypeRecords(typeRecords, ref anyMerged);
             }
 
-            if (enumerated.Count == 0)
+            if (fusionOutputs.Count == 0)
                 return Array.Empty<ICommand>();
 
-            var outputs = new List<CommandOutput>(enumerated.Count);
-            var mergeBuckets = new Dictionary<Type, List<CommandRecord>>();
+            fusionOutputs.Sort(CommandOutputComparer);
 
-            for (var i = 0; i < enumerated.Count; i++)
+#if DEBUG
+            validateFusionOutputs();
+#endif
+
+#if DEBUG
+            if (anyMerged)
+                Debug.WriteLine($"[FusionDebug] Fused {fusionOutputs.Count} commands (context object order {context.ObjectOrder}).");
+#endif
+
+            var fused = flushFusionOutputs();
+            return fused;
+        }
+
+        /// <summary>
+        /// Clones commands that cannot be merged and groups mergeable commands by their concrete type.
+        /// </summary>
+        private Dictionary<Type, List<CommandRecord>> buildCommandRecords(IEnumerable<ICommand> commands, FusionOrderingContext context)
+        {
+            Dictionary<Type, List<CommandRecord>> recordsByType = null;
+            var snapshotIndex = 0;
+
+            foreach (var command in commands)
             {
-                var command = enumerated[i];
+                if (command == null)
+                    continue;
 
+#if DEBUG
                 Debug.Assert(!double.IsNaN(command.StartTime) && !double.IsInfinity(command.StartTime), "Command start time must be finite");
                 Debug.Assert(!double.IsNaN(command.EndTime) && !double.IsInfinity(command.EndTime), "Command end time must be finite");
+#endif
 
-                if (command is CommandGroup group)
+                if (command is CommandGroup commandGroup)
                 {
-                    var clonedGroup = cloneGroup(group);
-                    outputs.Add(new CommandOutput(clonedGroup, command.GetType().Name, sanitize(group.StartTime), i));
+                    var clonedGroup = cloneGroup(commandGroup);
+                    fusionOutputs.Add(new CommandOutput(clonedGroup, command.GetType().Name, sanitize(commandGroup.StartTime), sanitize(commandGroup.EndTime), context.ObjectOrder, context.ContributorPriority, context.ContributorOrder, context.SnapshotBase + snapshotIndex, wasMerged: false));
+                    snapshotIndex++;
                     continue;
                 }
 
@@ -220,73 +281,146 @@ namespace StorybrewCommon.Storyboarding
                 if (!accessor.IsSupported)
                 {
                     var clone = accessor.Clone(command) ?? cloneViaMemberwise(command);
-                    outputs.Add(new CommandOutput(clone, accessor.TypeKey, sanitize(command.StartTime), i));
+                    fusionOutputs.Add(new CommandOutput(clone, accessor.TypeKey, sanitize(command.StartTime), sanitize(command.EndTime), context.ObjectOrder, context.ContributorPriority, context.ContributorOrder, context.SnapshotBase + snapshotIndex, wasMerged: false));
+                    snapshotIndex++;
                     continue;
                 }
 
-                if (!mergeBuckets.TryGetValue(command.GetType(), out var bucket))
-                    mergeBuckets[command.GetType()] = bucket = new List<CommandRecord>();
+                recordsByType ??= new Dictionary<Type, List<CommandRecord>>();
+                if (!recordsByType.TryGetValue(command.GetType(), out var recordsForType))
+                    recordsByType[command.GetType()] = recordsForType = new List<CommandRecord>();
 
-                bucket.Add(new CommandRecord(command, i, accessor));
+                recordsForType.Add(new CommandRecord(command, snapshotIndex++, accessor, context));
             }
 
-            foreach (var bucket in mergeBuckets.Values)
+            return recordsByType;
+        }
+
+        /// <summary>
+        /// Merges a list of sorted command records for a specific type, honouring zero-duration exclusions and merge tolerance.
+        /// </summary>
+        private void processCommandTypeRecords(List<CommandRecord> recordsForType, ref bool anyMerged)
+        {
+            if (recordsForType == null || recordsForType.Count == 0)
+                return;
+
+            recordsForType.Sort(CommandRecordComparer);
+
+            CommandFusionGroup currentGroup = null;
+
+            void flushCurrentGroup()
             {
-                if (bucket.Count == 0)
-                    continue;
+                if (currentGroup == null)
+                    return;
 
-                var accessor = bucket[0].Accessor;
-                bucket.Sort(CommandRecordComparer);
-
-                var group = new CommandFusionGroup(bucket[0]);
-                for (var i = 1; i < bucket.Count; i++)
-                {
-                    var record = bucket[i];
-                    if (!group.TryInclude(record))
-                    {
-                        appendGroup(outputs, accessor, group);
-                        group = new CommandFusionGroup(record);
-                    }
-                }
-                appendGroup(outputs, accessor, group);
-                bucket.Clear();
+                appendGroup(fusionOutputs, currentGroup, ref anyMerged);
+                currentGroup = null;
             }
 
-            outputs.Sort(CommandOutputComparer);
+            for (var i = 0; i < recordsForType.Count; i++)
+            {
+                var record = recordsForType[i];
 
-            var fused = new List<ICommand>(outputs.Count);
-            for (var i = 0; i < outputs.Count; i++)
-                fused.Add(outputs[i].Command);
+                if (record.IsZeroDuration)
+                {
+                    flushCurrentGroup();
+                    var zeroDurationGroup = new CommandFusionGroup(record, record.Context);
+                    appendGroup(fusionOutputs, zeroDurationGroup, ref anyMerged);
+#if DEBUG
+                    Debug.WriteLine($"[FusionDebug] Preserved zero-duration {record.Accessor.TypeKey} at {record.StartTime}.");
+#endif
+                    continue;
+                }
 
+                if (currentGroup == null)
+                {
+                    currentGroup = new CommandFusionGroup(record, record.Context);
+                    continue;
+                }
+
+                if (!currentGroup.TryInclude(record))
+                {
+                    flushCurrentGroup();
+                    currentGroup = new CommandFusionGroup(record, record.Context);
+                }
+            }
+
+            flushCurrentGroup();
+            recordsForType.Clear();
+        }
+
+        /// <summary>
+        /// Materialises the fused command list and clears intermediate buffers.
+        /// </summary>
+        private List<ICommand> flushFusionOutputs()
+        {
+            var fused = new List<ICommand>(fusionOutputs.Count);
+            for (var i = 0; i < fusionOutputs.Count; i++)
+                fused.Add(fusionOutputs[i].Command);
+
+            fusionOutputs.Clear();
             return fused;
         }
 
-        private void appendGroup(List<CommandOutput> outputs, CommandAccessor accessor, CommandFusionGroup group)
+#if DEBUG
+        /// <summary>
+        /// Validates fused command invariants in DEBUG builds to catch ordering or timing regressions early.
+        /// </summary>
+        private void validateFusionOutputs()
+        {
+            for (var i = 0; i < fusionOutputs.Count; i++)
+            {
+                var output = fusionOutputs[i];
+                Debug.Assert(output.StartTime <= output.EndTime + MergeTolerance, "Fused command must have non-negative duration");
+                Debug.Assert(!double.IsNaN(output.Command.StartTime) && !double.IsInfinity(output.Command.StartTime), "Fused command start time must be finite");
+                Debug.Assert(!double.IsNaN(output.Command.EndTime) && !double.IsInfinity(output.Command.EndTime), "Fused command end time must be finite");
+                Debug.Assert(!double.IsNaN(output.StartTime) && !double.IsInfinity(output.StartTime), "Ordering start time must be finite");
+                Debug.Assert(!double.IsNaN(output.EndTime) && !double.IsInfinity(output.EndTime), "Ordering end time must be finite");
+            }
+        }
+#endif
+
+        /// <summary>
+        /// Emits either the untouched clone of a command group or the merged command built from its members.
+        /// </summary>
+        private void appendGroup(List<CommandOutput> outputs, CommandFusionGroup group, ref bool anyMerged)
         {
             if (group == null || group.Count == 0)
                 return;
 
+            var accessor = group.Accessor;
             if (group.Count == 1)
             {
                 var record = group.First;
-                var clone = accessor.Clone(record.Command) ?? record.Command;
-                outputs.Add(new CommandOutput(clone, accessor.TypeKey, record.StartTime, record.OriginalIndex));
+                var clone = accessor.Clone(record.Command) ?? cloneCommand(record.Command);
+                outputs.Add(new CommandOutput(clone, accessor.TypeKey, record.StartTime, record.EndTime, record.Context.ObjectOrder, record.Context.ContributorPriority, record.Context.ContributorOrder, record.SnapshotIndex, false));
                 return;
             }
 
-            var easing = group.First?.Easing ?? OsbEasing.None;
+            var easing = group.First.Easing;
+            if (group.HasMixedEasing)
+            {
+#if DEBUG
+                Debug.WriteLine($"[FusionDebug] Easing conflict resolved using earliest easing {easing}.");
+#endif
+            }
+
             var fused = accessor.Create(easing, group.StartTime, group.EndTime, group.First.StartValue, group.Last.EndValue);
             if (fused == null)
             {
                 foreach (var record in group.Records)
                 {
-                    var clone = accessor.Clone(record.Command) ?? record.Command;
-                    outputs.Add(new CommandOutput(clone, accessor.TypeKey, record.StartTime, record.OriginalIndex));
+                    var clone = accessor.Clone(record.Command) ?? cloneCommand(record.Command);
+                    outputs.Add(new CommandOutput(clone, accessor.TypeKey, record.StartTime, record.EndTime, record.Context.ObjectOrder, record.Context.ContributorPriority, record.Context.ContributorOrder, record.SnapshotIndex, false));
                 }
                 return;
             }
 
-            outputs.Add(new CommandOutput(fused, accessor.TypeKey, group.StartTime, group.First.OriginalIndex));
+            anyMerged = true;
+            outputs.Add(new CommandOutput(fused, accessor.TypeKey, group.StartTime, group.EndTime, group.Context.ObjectOrder, group.Context.ContributorPriority, group.Context.ContributorOrder, group.First.SnapshotIndex, true));
+#if DEBUG
+            Debug.WriteLine($"[FusionDebug] Merged {group.Count} {accessor.TypeKey} commands spanning {group.StartTime}→{group.EndTime}.");
+#endif
         }
 
         private int compareEntries(Entry left, Entry right)
@@ -368,12 +502,20 @@ namespace StorybrewCommon.Storyboarding
                 return;
 
             var snapshot = new List<ICommand>(existing);
-            var fused = FuseCommands(snapshot);
-            var fusedList = fused as List<ICommand> ?? fused.ToList();
+            var context = buildFusionContext(sprite);
+            var fused = FuseCommands(snapshot, context);
 
-            spriteStateTracker.ApplyCommands(sprite, fusedList);
+            spriteStateTracker.ApplyCommands(sprite, fused);
 
-            fusionResults.Add(new CommandFusionResult(sprite, snapshot.Count, fusedList.Count));
+            fusionResults.Add(new CommandFusionResult(sprite, snapshot.Count, fused.Count));
+        }
+
+        private FusionOrderingContext buildFusionContext(StoryboardObject storyboardObject)
+        {
+            var entry = getOrCreateEntry(storyboardObject);
+            var contributor = getContributor(entry.ContributorId);
+            var snapshotBase = entry.Sequence << 32;
+            return new FusionOrderingContext(entry.Sequence, contributor.Priority, contributor.Order, snapshotBase);
         }
 
         private CommandAccessor getAccessor(Type commandType)
@@ -428,18 +570,41 @@ namespace StorybrewCommon.Storyboarding
             return entry;
         }
 
+        internal readonly struct FusionOrderingContext
+        {
+            public static FusionOrderingContext Default => new FusionOrderingContext(0, 0, 0, 0);
+
+            public FusionOrderingContext(long objectOrder, int contributorPriority, int contributorOrder, long snapshotBase)
+            {
+                ObjectOrder = objectOrder;
+                ContributorPriority = contributorPriority;
+                ContributorOrder = contributorOrder;
+                SnapshotBase = snapshotBase;
+            }
+
+            public long ObjectOrder { get; }
+            public int ContributorPriority { get; }
+            public int ContributorOrder { get; }
+            public long SnapshotBase { get; }
+        }
+
+        /// <summary>
+        /// Snapshot of an individual command used during fusion. Captures ordering metadata and values without mutating the source.
+        /// </summary>
         private sealed class CommandRecord
         {
-            public CommandRecord(ICommand command, int originalIndex, CommandAccessor accessor)
+            public CommandRecord(ICommand command, int originalIndex, CommandAccessor accessor, FusionOrderingContext context)
             {
                 Command = command;
                 OriginalIndex = originalIndex;
                 Accessor = accessor;
+                Context = context;
                 StartTime = sanitize(command.StartTime);
                 EndTime = sanitize(command.EndTime);
                 StartValue = accessor.GetStartValue(command);
                 EndValue = accessor.GetEndValue(command);
                 Easing = accessor.GetEasing(command);
+                SnapshotIndex = context.SnapshotBase + originalIndex;
 
 #if DEBUG
                 Debug.Assert(EndTime + MergeTolerance >= StartTime, "Command duration must be non-negative");
@@ -449,40 +614,62 @@ namespace StorybrewCommon.Storyboarding
             public ICommand Command { get; }
             public int OriginalIndex { get; }
             public CommandAccessor Accessor { get; }
+            public FusionOrderingContext Context { get; }
             public double StartTime { get; }
             public double EndTime { get; }
             public object StartValue { get; }
             public object EndValue { get; }
             public OsbEasing Easing { get; }
+            public long SnapshotIndex { get; }
+            public bool IsZeroDuration => Math.Abs(EndTime - StartTime) <= MergeTolerance;
         }
 
+        /// <summary>
+        /// Collects temporally overlapping command records for a specific storyboard object/type pair and determines whether
+        /// they can be merged safely.
+        /// </summary>
         private sealed class CommandFusionGroup
         {
-            public CommandFusionGroup(CommandRecord seed)
+            public CommandFusionGroup(CommandRecord seed, FusionOrderingContext context)
             {
                 records = new List<CommandRecord> { seed };
+                Context = context;
                 StartTime = seed.StartTime;
                 EndTime = seed.EndTime;
                 First = seed;
                 Last = seed;
+                easingSignature = seed.Easing;
+                HasMixedEasing = false;
             }
 
             private readonly List<CommandRecord> records;
+            private readonly OsbEasing easingSignature;
+
             public IReadOnlyList<CommandRecord> Records => records;
             public double StartTime { get; private set; }
             public double EndTime { get; private set; }
             public CommandRecord First { get; private set; }
             public CommandRecord Last { get; private set; }
             public int Count => records.Count;
+            public FusionOrderingContext Context { get; }
+            public CommandAccessor Accessor => First.Accessor;
+            public bool HasMixedEasing { get; private set; }
 
             public bool TryInclude(CommandRecord candidate)
             {
                 if (candidate.StartTime > EndTime + MergeTolerance)
                     return false;
 
+#if DEBUG
+                Debug.Assert(candidate.Context.ObjectOrder == Context.ObjectOrder, "Fusion groups must not span multiple objects.");
+#endif
+
                 records.Add(candidate);
                 StartTime = Math.Min(StartTime, candidate.StartTime);
                 EndTime = Math.Max(EndTime, candidate.EndTime);
+
+                if (!HasMixedEasing && candidate.Easing != easingSignature)
+                    HasMixedEasing = true;
 
                 if (candidate.EndTime > Last.EndTime || (Math.Abs(candidate.EndTime - Last.EndTime) <= MergeTolerance && candidate.OriginalIndex > Last.OriginalIndex))
                     Last = candidate;
@@ -496,18 +683,28 @@ namespace StorybrewCommon.Storyboarding
 
         private readonly struct CommandOutput
         {
-            public CommandOutput(ICommand command, string typeKey, double startTime, int originalIndex)
+            public CommandOutput(ICommand command, string typeKey, double startTime, double endTime, long objectOrder, int contributorPriority, int contributorOrder, long snapshotIndex, bool merged)
             {
                 Command = command;
                 TypeKey = typeKey;
                 StartTime = startTime;
-                OriginalIndex = originalIndex;
+                EndTime = endTime;
+                ObjectOrder = objectOrder;
+                ContributorPriority = contributorPriority;
+                ContributorOrder = contributorOrder;
+                SnapshotIndex = snapshotIndex;
+                WasMerged = merged;
             }
 
             public ICommand Command { get; }
             public string TypeKey { get; }
             public double StartTime { get; }
-            public int OriginalIndex { get; }
+            public double EndTime { get; }
+            public long ObjectOrder { get; }
+            public int ContributorPriority { get; }
+            public int ContributorOrder { get; }
+            public long SnapshotIndex { get; }
+            public bool WasMerged { get; }
         }
 
         public sealed class CommandFusionResult
@@ -525,17 +722,56 @@ namespace StorybrewCommon.Storyboarding
             public bool HasFusion => FusedCount < OriginalCount;
         }
 
+        private sealed class FusionCommandComparer : IComparer<ICommand>
+        {
+            public int Compare(ICommand x, ICommand y)
+            {
+                if (ReferenceEquals(x, y))
+                    return 0;
+                if (x == null)
+                    return -1;
+                if (y == null)
+                    return 1;
+
+                var typeComparison = string.CompareOrdinal(x.GetType().Name, y.GetType().Name);
+                if (typeComparison != 0)
+                    return typeComparison;
+
+                var startComparison = sanitize(x.StartTime).CompareTo(sanitize(y.StartTime));
+                if (startComparison != 0)
+                    return startComparison;
+
+                var endComparison = sanitize(x.EndTime).CompareTo(sanitize(y.EndTime));
+                if (endComparison != 0)
+                    return endComparison;
+
+                return 0;
+            }
+        }
+
         private static readonly Comparison<CommandRecord> CommandRecordComparer = (left, right) =>
         {
             var start = left.StartTime.CompareTo(right.StartTime);
             if (start != 0)
                 return start;
 
-            return left.OriginalIndex.CompareTo(right.OriginalIndex);
+            var end = left.EndTime.CompareTo(right.EndTime);
+            if (end != 0)
+                return end;
+
+            return left.SnapshotIndex.CompareTo(right.SnapshotIndex);
         };
 
+        /// <summary>
+        /// Implements the final deterministic ordering: object creation order, command type, start, end, contributor priority,
+        /// contributor order, then snapshot index.
+        /// </summary>
         private static readonly Comparison<CommandOutput> CommandOutputComparer = (left, right) =>
         {
+            var objectOrder = left.ObjectOrder.CompareTo(right.ObjectOrder);
+            if (objectOrder != 0)
+                return objectOrder;
+
             var typeComparison = string.CompareOrdinal(left.TypeKey, right.TypeKey);
             if (typeComparison != 0)
                 return typeComparison;
@@ -544,9 +780,25 @@ namespace StorybrewCommon.Storyboarding
             if (startComparison != 0)
                 return startComparison;
 
-            return left.OriginalIndex.CompareTo(right.OriginalIndex);
+            var endComparison = left.EndTime.CompareTo(right.EndTime);
+            if (endComparison != 0)
+                return endComparison;
+
+            var priorityComparison = left.ContributorPriority.CompareTo(right.ContributorPriority);
+            if (priorityComparison != 0)
+                return priorityComparison;
+
+            var contributorOrder = left.ContributorOrder.CompareTo(right.ContributorOrder);
+            if (contributorOrder != 0)
+                return contributorOrder;
+
+            return left.SnapshotIndex.CompareTo(right.SnapshotIndex);
         };
 
+        /// <summary>
+        /// Reconstructs sprite command timelines after fusion using reflection, keeping runtime objects consistent without
+        /// exposing editor-only state to callers.
+        /// </summary>
         private sealed class SpriteStateTracker
         {
             private static readonly Type SpriteType = typeof(OsbSprite);
@@ -566,6 +818,9 @@ namespace StorybrewCommon.Storyboarding
             public List<ICommand> GetCommands(OsbSprite sprite)
                 => commandsField?.GetValue(sprite) as List<ICommand>;
 
+            /// <summary>
+            /// Rebuilds the sprite's internal command lists with the supplied fused commands.
+            /// </summary>
             public void ApplyCommands(OsbSprite sprite, IReadOnlyList<ICommand> commands)
             {
                 if (sprite == null)

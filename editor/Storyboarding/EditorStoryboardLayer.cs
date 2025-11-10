@@ -236,6 +236,8 @@ namespace StorybrewEditor.Storyboarding
                 rawObjects = segment.RawObjects;
             }
 
+            // Fusion is performed once here to unify shared-layer commands before post-processing.
+            // The returned commands are already ordered and normalized for serialization.
             var fusionResults = CommandCoordinator.MergeCommands(rawObjects);
 
             if (fusionResults.Count > 0)

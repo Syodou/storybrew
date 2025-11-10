@@ -14,6 +14,10 @@ namespace StorybrewEditor.Storyboarding
 {
     public class EditorGeneratorContext : GeneratorContext
     {
+        private static readonly AsyncLocal<EditorGeneratorContext> activeContext = new AsyncLocal<EditorGeneratorContext>();
+
+        public static EditorGeneratorContext Current => activeContext.Value;
+
         private readonly Effect effect;
         private readonly MultiFileWatcher watcher;
 
@@ -72,6 +76,8 @@ namespace StorybrewEditor.Storyboarding
 
         private EditorStoryboardLayer unnamedLayer;
 
+        internal Effect Effect => effect;
+
         public EditorGeneratorContext(Effect effect,
             string projectPath, string projectAssetPath, string mapsetPath,
             EditorBeatmap beatmap, IEnumerable<EditorBeatmap> beatmaps,
@@ -108,7 +114,10 @@ namespace StorybrewEditor.Storyboarding
 
             // Already exists?
             if (layersByIdentifier.TryGetValue(identifier, out var existing))
+            {
+                existing.RegisterContributor(effect);
                 return existing;
+            }
 
             // Create new layer
             var layer = new EditorStoryboardLayer(identifier, effect);
@@ -118,6 +127,8 @@ namespace StorybrewEditor.Storyboarding
 
             // Bind cache
             layersByIdentifier[identifier] = layer;
+
+            layer.RegisterContributor(effect);
 
             return layer;
         }
@@ -141,9 +152,13 @@ namespace StorybrewEditor.Storyboarding
         // ✅ Ensures shared-context created layers sync with editor cache
         internal void RebindLayer(string identifier, StoryboardLayer layer)
         {
-            layersByIdentifier[identifier ?? ""] = (EditorStoryboardLayer)layer;
+            var editorLayer = (EditorStoryboardLayer)layer;
+
+            layersByIdentifier[identifier ?? ""] = editorLayer;
             if (!EditorLayers.Contains(layer))
-                EditorLayers.Add((EditorStoryboardLayer)layer);
+                EditorLayers.Add(editorLayer);
+
+            editorLayer.RegisterContributor(effect);
         }
 
         // ✅ Clean, guaranteed-unique register
@@ -164,6 +179,8 @@ namespace StorybrewEditor.Storyboarding
             // Assign unnamed layer
             if (layer.Identifier == null)
                 unnamedLayer ??= layer;
+
+            layer.RegisterContributor(effect);
 
             return layer;
         }
@@ -199,11 +216,38 @@ namespace StorybrewEditor.Storyboarding
 
         public void DisposeResources()
         {
-            foreach (var audioStream in fftAudioStreams.Values)
-                audioStream.Dispose();
-            fftAudioStreams = null;
+            if (fftAudioStreams != null)
+            {
+                foreach (var audioStream in fftAudioStreams.Values)
+                    audioStream.Dispose();
+                fftAudioStreams = null;
+            }
 
             StoryboardContext = null;
+        }
+
+        public IDisposable Activate()
+            => new ActivationCookie(this);
+
+        private sealed class ActivationCookie : IDisposable
+        {
+            private readonly EditorGeneratorContext previous;
+            private bool disposed;
+
+            public ActivationCookie(EditorGeneratorContext context)
+            {
+                previous = activeContext.Value;
+                activeContext.Value = context;
+            }
+
+            public void Dispose()
+            {
+                if (disposed)
+                    return;
+
+                activeContext.Value = previous;
+                disposed = true;
+            }
         }
     }
 }

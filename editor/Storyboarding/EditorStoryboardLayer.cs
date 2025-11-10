@@ -236,7 +236,29 @@ namespace StorybrewEditor.Storyboarding
                 rawObjects = segment.RawObjects;
             }
 
-            CommandCoordinator.MergeCommands(rawObjects);
+            var fusionResults = CommandCoordinator.MergeCommands(rawObjects);
+
+            if (fusionResults.Count > 0)
+            {
+                var context = EditorGeneratorContext.Current;
+                if (context != null)
+                {
+                    foreach (var result in fusionResults)
+                    {
+                        if (!result.HasFusion)
+                            continue;
+
+                        var targetName = result.StoryboardObject switch
+                        {
+                            OsbSprite sprite => string.IsNullOrEmpty(sprite.TexturePath) ? sprite.ToString() : sprite.TexturePath,
+                            StoryboardSegment segment => segment.Identifier ?? segment.ToString(),
+                            _ => result.StoryboardObject?.ToString() ?? "(unknown object)"
+                        };
+
+                        context.AppendLog($"Fusion [{Identifier ?? string.Empty}]: {targetName} {result.OriginalCount} → {result.FusedCount}");
+                    }
+                }
+            }
         }
     }
 }

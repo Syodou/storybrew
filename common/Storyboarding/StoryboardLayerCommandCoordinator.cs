@@ -4,6 +4,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Diagnostics;
 
 namespace StorybrewCommon.Storyboarding
 {
@@ -21,25 +22,12 @@ namespace StorybrewCommon.Storyboarding
         private readonly Dictionary<StoryboardObject, Entry> entriesByObject = new Dictionary<StoryboardObject, Entry>();
         private readonly List<Entry> scratchEntries = new List<Entry>();
         private readonly Dictionary<Type, CommandAccessor> commandAccessors = new Dictionary<Type, CommandAccessor>();
-        private readonly Dictionary<string, List<CommandRecord>> fusionBuckets = new Dictionary<string, List<CommandRecord>>(StringComparer.Ordinal);
-        private readonly List<CommandFusionGroup> fusionGroups = new List<CommandFusionGroup>();
-        private readonly List<ICommand> commandsToRemove = new List<ICommand>();
-        private readonly Dictionary<ICommand, int> originalCommandOrder = new Dictionary<ICommand, int>();
+        private readonly SpriteStateTracker spriteStateTracker = new SpriteStateTracker();
+        private readonly List<CommandFusionResult> fusionResults = new List<CommandFusionResult>();
 
         private const double MergeTolerance = 0.0001d;
 
-        private static readonly Type osbSpriteType = typeof(OsbSprite);
-        private static readonly FieldInfo spriteCommandsField = osbSpriteType.GetField("commands", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly FieldInfo spriteDisplayTimelinesField = osbSpriteType.GetField("displayTimelines", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly FieldInfo spriteCurrentCommandGroupField = osbSpriteType.GetField("currentCommandGroup", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly FieldInfo spriteGroupEndActionField = osbSpriteType.GetField("groupEndAction", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly MethodInfo spriteInitializeDisplayTimelinesMethod = osbSpriteType.GetMethod("initializeDisplayTimelines", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly MethodInfo spriteAddDisplayCommandMethod = osbSpriteType.GetMethod("addDisplayCommand", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly MethodInfo spriteStartLoopDisplayGroupMethod = osbSpriteType.GetMethod("startDisplayGroup", BindingFlags.Instance | BindingFlags.NonPublic, null, new[] { typeof(LoopCommand) }, null);
-        private static readonly MethodInfo spriteStartTriggerDisplayGroupMethod = osbSpriteType.GetMethod("startDisplayGroup", BindingFlags.Instance | BindingFlags.NonPublic, null, new[] { typeof(TriggerCommand) }, null);
-        private static readonly MethodInfo spriteEndDisplayGroupMethod = osbSpriteType.GetMethod("endDisplayGroup", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly MethodInfo spriteClearStartEndTimesMethod = osbSpriteType.GetMethod("clearStartEndTimes", BindingFlags.Instance | BindingFlags.NonPublic);
-        private static readonly PropertyInfo spriteHasTriggerProperty = osbSpriteType.GetProperty("HasTrigger", BindingFlags.Instance | BindingFlags.Public);
+        private static readonly MethodInfo MemberwiseCloneMethod = typeof(object).GetMethod("MemberwiseClone", BindingFlags.Instance | BindingFlags.NonPublic);
 
         private long nextSequence;
         private int nextContributorOrder;
@@ -175,16 +163,130 @@ namespace StorybrewCommon.Storyboarding
             }
         }
 
-        public void MergeCommands(IReadOnlyList<StoryboardObject> objects)
+        public IReadOnlyList<CommandFusionResult> MergeCommands(IReadOnlyList<StoryboardObject> objects)
         {
             if (objects == null || objects.Count == 0)
-                return;
+                return Array.Empty<CommandFusionResult>();
+
+            fusionResults.Clear();
 
             lock (syncRoot)
             {
                 for (var i = 0; i < objects.Count; i++)
                     mergeCommandsRecursive(objects[i]);
             }
+
+            if (fusionResults.Count == 0)
+                return Array.Empty<CommandFusionResult>();
+
+            var results = fusionResults.ToArray();
+            fusionResults.Clear();
+            return results;
+        }
+
+        public IReadOnlyList<ICommand> FuseCommands(IEnumerable<ICommand> commands)
+        {
+            if (commands == null)
+                return Array.Empty<ICommand>();
+
+            var enumerated = new List<ICommand>();
+            foreach (var command in commands)
+            {
+                if (command != null)
+                    enumerated.Add(command);
+            }
+
+            if (enumerated.Count == 0)
+                return Array.Empty<ICommand>();
+
+            var outputs = new List<CommandOutput>(enumerated.Count);
+            var mergeBuckets = new Dictionary<Type, List<CommandRecord>>();
+
+            for (var i = 0; i < enumerated.Count; i++)
+            {
+                var command = enumerated[i];
+
+                Debug.Assert(!double.IsNaN(command.StartTime) && !double.IsInfinity(command.StartTime), "Command start time must be finite");
+                Debug.Assert(!double.IsNaN(command.EndTime) && !double.IsInfinity(command.EndTime), "Command end time must be finite");
+
+                if (command is CommandGroup group)
+                {
+                    var clonedGroup = cloneGroup(group);
+                    outputs.Add(new CommandOutput(clonedGroup, command.GetType().Name, sanitize(group.StartTime), i));
+                    continue;
+                }
+
+                var accessor = getAccessor(command.GetType());
+                if (!accessor.IsSupported)
+                {
+                    var clone = accessor.Clone(command) ?? cloneViaMemberwise(command);
+                    outputs.Add(new CommandOutput(clone, accessor.TypeKey, sanitize(command.StartTime), i));
+                    continue;
+                }
+
+                if (!mergeBuckets.TryGetValue(command.GetType(), out var bucket))
+                    mergeBuckets[command.GetType()] = bucket = new List<CommandRecord>();
+
+                bucket.Add(new CommandRecord(command, i, accessor));
+            }
+
+            foreach (var bucket in mergeBuckets.Values)
+            {
+                if (bucket.Count == 0)
+                    continue;
+
+                var accessor = bucket[0].Accessor;
+                bucket.Sort(CommandRecordComparer);
+
+                var group = new CommandFusionGroup(bucket[0]);
+                for (var i = 1; i < bucket.Count; i++)
+                {
+                    var record = bucket[i];
+                    if (!group.TryInclude(record))
+                    {
+                        appendGroup(outputs, accessor, group);
+                        group = new CommandFusionGroup(record);
+                    }
+                }
+                appendGroup(outputs, accessor, group);
+                bucket.Clear();
+            }
+
+            outputs.Sort(CommandOutputComparer);
+
+            var fused = new List<ICommand>(outputs.Count);
+            for (var i = 0; i < outputs.Count; i++)
+                fused.Add(outputs[i].Command);
+
+            return fused;
+        }
+
+        private void appendGroup(List<CommandOutput> outputs, CommandAccessor accessor, CommandFusionGroup group)
+        {
+            if (group == null || group.Count == 0)
+                return;
+
+            if (group.Count == 1)
+            {
+                var record = group.First;
+                var clone = accessor.Clone(record.Command) ?? record.Command;
+                outputs.Add(new CommandOutput(clone, accessor.TypeKey, record.StartTime, record.OriginalIndex));
+                return;
+            }
+
+            var easing = group.First?.Easing ?? OsbEasing.None;
+            var fused = accessor.Create(easing, group.StartTime, group.EndTime, group.First.StartValue, group.Last.EndValue);
+            if (fused == null)
+            {
+                foreach (var record in group.Records)
+                {
+                    var clone = accessor.Clone(record.Command) ?? record.Command;
+                    outputs.Add(new CommandOutput(clone, accessor.TypeKey, record.StartTime, record.OriginalIndex));
+                }
+                return;
+            }
+
+            outputs.Add(new CommandOutput(fused, accessor.TypeKey, group.StartTime, group.First.OriginalIndex));
         }
 
         private int compareEntries(Entry left, Entry right)
@@ -240,166 +342,38 @@ namespace StorybrewCommon.Storyboarding
             if (storyboardObject == null)
                 return;
 
-            var entry = getOrCreateEntry(storyboardObject);
+            getOrCreateEntry(storyboardObject);
 
             if (storyboardObject is OsbSprite sprite)
             {
-                mergeSpriteCommands(sprite, entry);
+                mergeSpriteCommands(sprite);
                 return;
             }
 
             if (storyboardObject is StoryboardSegment segment)
             {
-                var objects = segment.Objects;
-                if (objects == null || objects.Count == 0)
+                var children = segment.Objects;
+                if (children == null || children.Count == 0)
                     return;
 
-                for (var i = 0; i < objects.Count; i++)
-                    mergeCommandsRecursive(objects[i]);
+                for (var i = 0; i < children.Count; i++)
+                    mergeCommandsRecursive(children[i]);
             }
         }
 
-        private void mergeSpriteCommands(OsbSprite sprite, Entry entry)
+        private void mergeSpriteCommands(OsbSprite sprite)
         {
-            if (spriteCommandsField?.GetValue(sprite) is not List<ICommand> commands || commands.Count == 0)
+            var existing = spriteStateTracker.GetCommands(sprite);
+            if (existing == null || existing.Count == 0)
                 return;
 
-            originalCommandOrder.Clear();
-            for (var i = 0; i < commands.Count; i++)
-                originalCommandOrder[commands[i]] = i;
+            var snapshot = new List<ICommand>(existing);
+            var fused = FuseCommands(snapshot);
+            var fusedList = fused as List<ICommand> ?? fused.ToList();
 
-            fusionBuckets.Clear();
-            fusionGroups.Clear();
-            commandsToRemove.Clear();
+            spriteStateTracker.ApplyCommands(sprite, fusedList);
 
-            for (var i = 0; i < commands.Count; i++)
-            {
-                var command = commands[i];
-                if (command == null || command is CommandGroup)
-                    continue;
-
-                var key = buildFusionKey(entry.ContributorId, command);
-                if (!fusionBuckets.TryGetValue(key, out var bucket))
-                    fusionBuckets[key] = bucket = new List<CommandRecord>();
-
-                bucket.Add(new CommandRecord(command, originalCommandOrder[command]));
-            }
-
-            foreach (var bucket in fusionBuckets.Values)
-            {
-                if (bucket.Count <= 1)
-                {
-                    bucket.Clear();
-                    continue;
-                }
-
-                bucket.Sort(CommandRecordComparer);
-
-                var group = new CommandFusionGroup(bucket[0]);
-                for (var i = 1; i < bucket.Count; i++)
-                {
-                    var record = bucket[i];
-                    if (!group.Include(record))
-                    {
-                        fusionGroups.Add(group);
-                        group = new CommandFusionGroup(record);
-                    }
-                }
-                fusionGroups.Add(group);
-                bucket.Clear();
-            }
-
-            fusionBuckets.Clear();
-
-            var mutated = false;
-
-            foreach (var group in fusionGroups)
-            {
-                if (group.Commands.Count <= 1)
-                    continue;
-
-                if (tryFuseGroup(group))
-                    mutated = true;
-            }
-
-            fusionGroups.Clear();
-
-            if (commandsToRemove.Count > 0)
-            {
-                foreach (var command in commandsToRemove)
-                {
-                    commands.Remove(command);
-                    originalCommandOrder.Remove(command);
-                }
-                commandsToRemove.Clear();
-                mutated = true;
-            }
-
-            if (commands.Count > 1 && reorderCommands(commands, entry))
-                mutated = true;
-
-            if (mutated)
-                rebuildSpriteState(sprite, commands);
-
-            originalCommandOrder.Clear();
-        }
-
-        private bool tryFuseGroup(CommandFusionGroup group)
-        {
-            var firstCommand = group.Commands[0].Command;
-            var accessor = getAccessor(firstCommand.GetType());
-            if (!accessor.IsSupported)
-                return false;
-
-            var startValue = accessor.GetStartValue(firstCommand);
-            var easing = accessor.GetEasing(firstCommand);
-            var endValue = accessor.GetEndValue(group.EndValueSource.Command);
-
-            accessor.SetStartTime(firstCommand, group.StartTime);
-            accessor.SetEndTime(firstCommand, group.EndTime);
-            accessor.SetStartValue(firstCommand, startValue);
-            accessor.SetEndValue(firstCommand, endValue);
-            accessor.SetEasing(firstCommand, easing);
-
-            for (var i = 1; i < group.Commands.Count; i++)
-                commandsToRemove.Add(group.Commands[i].Command);
-
-            return true;
-        }
-
-        private bool reorderCommands(List<ICommand> commands, Entry entry)
-        {
-            var snapshot = new List<ICommand>(commands);
-            commands.Sort((left, right) => compareCommandOrdering(left, right, entry));
-
-            for (var i = 0; i < commands.Count; i++)
-            {
-                if (!ReferenceEquals(snapshot[i], commands[i]))
-                    return true;
-            }
-            return false;
-        }
-
-        private int compareCommandOrdering(ICommand left, ICommand right, Entry entry)
-        {
-            if (ReferenceEquals(left, right))
-                return 0;
-
-            var typeComparison = string.CompareOrdinal(getCommandTypeKey(left), getCommandTypeKey(right));
-            if (typeComparison != 0)
-                return typeComparison;
-
-            var startComparison = sanitize(left.StartTime).CompareTo(sanitize(right.StartTime));
-            if (startComparison != 0)
-                return startComparison;
-
-            var contributorComparison = compareContributors(entry.ContributorId, entry.ContributorId);
-            if (contributorComparison != 0)
-                return contributorComparison;
-
-            var leftOrder = originalCommandOrder.TryGetValue(left, out var leftIndex) ? leftIndex : int.MaxValue;
-            var rightOrder = originalCommandOrder.TryGetValue(right, out var rightIndex) ? rightIndex : int.MaxValue;
-            return leftOrder.CompareTo(rightOrder);
+            fusionResults.Add(new CommandFusionResult(sprite, snapshot.Count, fusedList.Count));
         }
 
         private CommandAccessor getAccessor(Type commandType)
@@ -410,51 +384,39 @@ namespace StorybrewCommon.Storyboarding
             return accessor;
         }
 
-        private void rebuildSpriteState(OsbSprite sprite, List<ICommand> commands)
+        private ICommand cloneGroup(CommandGroup group)
         {
-            if (spriteDisplayTimelinesField?.GetValue(sprite) is IList displayTimelines)
-                displayTimelines.Clear();
-
-            spriteCurrentCommandGroupField?.SetValue(sprite, null);
-            spriteGroupEndActionField?.SetValue(sprite, null);
-            spriteInitializeDisplayTimelinesMethod?.Invoke(sprite, null);
-
-            var hasTrigger = false;
-            for (var i = 0; i < commands.Count; i++)
-                rebuildSpriteCommandState(sprite, commands[i], ref hasTrigger);
-
-            if (spriteHasTriggerProperty != null)
+            switch (group)
             {
-                var setter = spriteHasTriggerProperty.GetSetMethod(true);
-                setter?.Invoke(sprite, new object[] { hasTrigger });
+                case LoopCommand loop:
+                    var loopClone = new LoopCommand(loop.StartTime, loop.LoopCount);
+                    foreach (var command in loop.Commands)
+                        loopClone.Add(cloneCommand(command));
+                    return loopClone;
+                case TriggerCommand trigger:
+                    var triggerClone = new TriggerCommand(trigger.TriggerName, trigger.StartTime, trigger.EndTime, trigger.Group);
+                    foreach (var command in trigger.Commands)
+                        triggerClone.Add(cloneCommand(command));
+                    return triggerClone;
+                default:
+                    var clone = (CommandGroup)Activator.CreateInstance(group.GetType());
+                    foreach (var command in group.Commands)
+                        clone.Add(cloneCommand(command));
+                    return clone;
             }
-
-            spriteClearStartEndTimesMethod?.Invoke(sprite, null);
         }
 
-        private void rebuildSpriteCommandState(OsbSprite sprite, ICommand command, ref bool hasTrigger)
+        private ICommand cloneCommand(ICommand command)
         {
-            if (command is TriggerCommand trigger)
-            {
-                hasTrigger = true;
-                spriteStartTriggerDisplayGroupMethod?.Invoke(sprite, new object[] { trigger });
-                foreach (var nested in trigger.Commands)
-                    rebuildSpriteCommandState(sprite, nested, ref hasTrigger);
-                spriteEndDisplayGroupMethod?.Invoke(sprite, null);
-                return;
-            }
+            if (command is CommandGroup group)
+                return cloneGroup(group);
 
-            if (command is LoopCommand loop)
-            {
-                spriteStartLoopDisplayGroupMethod?.Invoke(sprite, new object[] { loop });
-                foreach (var nested in loop.Commands)
-                    rebuildSpriteCommandState(sprite, nested, ref hasTrigger);
-                spriteEndDisplayGroupMethod?.Invoke(sprite, null);
-                return;
-            }
-
-            spriteAddDisplayCommandMethod?.Invoke(sprite, new object[] { command });
+            var accessor = getAccessor(command.GetType());
+            return accessor.Clone(command) ?? cloneViaMemberwise(command);
         }
+
+        private static ICommand cloneViaMemberwise(ICommand command)
+            => (ICommand)MemberwiseCloneMethod.Invoke(command, null);
 
         private Entry getOrCreateEntry(StoryboardObject storyboardObject)
         {
@@ -466,8 +428,102 @@ namespace StorybrewCommon.Storyboarding
             return entry;
         }
 
-        private static string buildFusionKey(Guid contributorId, ICommand command)
-            => string.Concat(contributorId.ToString("N"), ":", command.GetType().Name);
+        private sealed class CommandRecord
+        {
+            public CommandRecord(ICommand command, int originalIndex, CommandAccessor accessor)
+            {
+                Command = command;
+                OriginalIndex = originalIndex;
+                Accessor = accessor;
+                StartTime = sanitize(command.StartTime);
+                EndTime = sanitize(command.EndTime);
+                StartValue = accessor.GetStartValue(command);
+                EndValue = accessor.GetEndValue(command);
+                Easing = accessor.GetEasing(command);
+
+#if DEBUG
+                Debug.Assert(EndTime + MergeTolerance >= StartTime, "Command duration must be non-negative");
+#endif
+            }
+
+            public ICommand Command { get; }
+            public int OriginalIndex { get; }
+            public CommandAccessor Accessor { get; }
+            public double StartTime { get; }
+            public double EndTime { get; }
+            public object StartValue { get; }
+            public object EndValue { get; }
+            public OsbEasing Easing { get; }
+        }
+
+        private sealed class CommandFusionGroup
+        {
+            public CommandFusionGroup(CommandRecord seed)
+            {
+                records = new List<CommandRecord> { seed };
+                StartTime = seed.StartTime;
+                EndTime = seed.EndTime;
+                First = seed;
+                Last = seed;
+            }
+
+            private readonly List<CommandRecord> records;
+            public IReadOnlyList<CommandRecord> Records => records;
+            public double StartTime { get; private set; }
+            public double EndTime { get; private set; }
+            public CommandRecord First { get; private set; }
+            public CommandRecord Last { get; private set; }
+            public int Count => records.Count;
+
+            public bool TryInclude(CommandRecord candidate)
+            {
+                if (candidate.StartTime > EndTime + MergeTolerance)
+                    return false;
+
+                records.Add(candidate);
+                StartTime = Math.Min(StartTime, candidate.StartTime);
+                EndTime = Math.Max(EndTime, candidate.EndTime);
+
+                if (candidate.EndTime > Last.EndTime || (Math.Abs(candidate.EndTime - Last.EndTime) <= MergeTolerance && candidate.OriginalIndex > Last.OriginalIndex))
+                    Last = candidate;
+
+                if (candidate.StartTime < First.StartTime || (Math.Abs(candidate.StartTime - First.StartTime) <= MergeTolerance && candidate.OriginalIndex < First.OriginalIndex))
+                    First = candidate;
+
+                return true;
+            }
+        }
+
+        private readonly struct CommandOutput
+        {
+            public CommandOutput(ICommand command, string typeKey, double startTime, int originalIndex)
+            {
+                Command = command;
+                TypeKey = typeKey;
+                StartTime = startTime;
+                OriginalIndex = originalIndex;
+            }
+
+            public ICommand Command { get; }
+            public string TypeKey { get; }
+            public double StartTime { get; }
+            public int OriginalIndex { get; }
+        }
+
+        public sealed class CommandFusionResult
+        {
+            internal CommandFusionResult(StoryboardObject storyboardObject, int originalCount, int fusedCount)
+            {
+                StoryboardObject = storyboardObject;
+                OriginalCount = originalCount;
+                FusedCount = fusedCount;
+            }
+
+            public StoryboardObject StoryboardObject { get; }
+            public int OriginalCount { get; }
+            public int FusedCount { get; }
+            public bool HasFusion => FusedCount < OriginalCount;
+        }
 
         private static readonly Comparison<CommandRecord> CommandRecordComparer = (left, right) =>
         {
@@ -478,104 +534,210 @@ namespace StorybrewCommon.Storyboarding
             return left.OriginalIndex.CompareTo(right.OriginalIndex);
         };
 
-        private static string getCommandTypeKey(ICommand command)
-            => command.GetType().Name;
-
-        private sealed class CommandRecord
+        private static readonly Comparison<CommandOutput> CommandOutputComparer = (left, right) =>
         {
-            public CommandRecord(ICommand command, int originalIndex)
-            {
-                Command = command;
-                OriginalIndex = originalIndex;
-                StartTime = sanitize(command.StartTime);
-                EndTime = sanitize(command.EndTime);
-            }
+            var typeComparison = string.CompareOrdinal(left.TypeKey, right.TypeKey);
+            if (typeComparison != 0)
+                return typeComparison;
 
-            public ICommand Command { get; }
-            public int OriginalIndex { get; }
-            public double StartTime { get; }
-            public double EndTime { get; }
-        }
+            var startComparison = left.StartTime.CompareTo(right.StartTime);
+            if (startComparison != 0)
+                return startComparison;
 
-        private sealed class CommandFusionGroup
+            return left.OriginalIndex.CompareTo(right.OriginalIndex);
+        };
+
+        private sealed class SpriteStateTracker
         {
-            private CommandRecord endValueSource;
+            private static readonly Type SpriteType = typeof(OsbSprite);
 
-            public CommandFusionGroup(CommandRecord seed)
+            private readonly FieldInfo commandsField = SpriteType.GetField("commands", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly FieldInfo displayTimelinesField = SpriteType.GetField("displayTimelines", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly FieldInfo currentCommandGroupField = SpriteType.GetField("currentCommandGroup", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly FieldInfo groupEndActionField = SpriteType.GetField("groupEndAction", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly MethodInfo initializeDisplayTimelinesMethod = SpriteType.GetMethod("initializeDisplayTimelines", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly MethodInfo addDisplayCommandMethod = SpriteType.GetMethod("addDisplayCommand", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly MethodInfo startLoopDisplayGroupMethod = SpriteType.GetMethod("startDisplayGroup", BindingFlags.Instance | BindingFlags.NonPublic, null, new[] { typeof(LoopCommand) }, null);
+            private readonly MethodInfo startTriggerDisplayGroupMethod = SpriteType.GetMethod("startDisplayGroup", BindingFlags.Instance | BindingFlags.NonPublic, null, new[] { typeof(TriggerCommand) }, null);
+            private readonly MethodInfo endDisplayGroupMethod = SpriteType.GetMethod("endDisplayGroup", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly MethodInfo clearStartEndTimesMethod = SpriteType.GetMethod("clearStartEndTimes", BindingFlags.Instance | BindingFlags.NonPublic);
+            private readonly PropertyInfo hasTriggerProperty = SpriteType.GetProperty("HasTrigger", BindingFlags.Instance | BindingFlags.Public);
+
+            public List<ICommand> GetCommands(OsbSprite sprite)
+                => commandsField?.GetValue(sprite) as List<ICommand>;
+
+            public void ApplyCommands(OsbSprite sprite, IReadOnlyList<ICommand> commands)
             {
-                Commands = new List<CommandRecord> { seed };
-                StartTime = seed.StartTime;
-                EndTime = seed.EndTime;
-                endValueSource = seed;
-            }
+                if (sprite == null)
+                    return;
 
-            public List<CommandRecord> Commands { get; }
-            public double StartTime { get; private set; }
-            public double EndTime { get; private set; }
-            public CommandRecord EndValueSource => endValueSource;
-
-            public bool Include(CommandRecord candidate)
-            {
-                if (candidate.StartTime > EndTime + MergeTolerance)
-                    return false;
-
-                Commands.Add(candidate);
-                StartTime = Math.Min(StartTime, candidate.StartTime);
-
-                if (candidate.EndTime > EndTime)
+                if (commandsField?.GetValue(sprite) is List<ICommand> target)
                 {
-                    EndTime = candidate.EndTime;
-                    endValueSource = candidate;
-                }
-                else EndTime = Math.Max(EndTime, candidate.EndTime);
+                    target.Clear();
+                    if (commands != null && commands.Count > 0)
+                    {
+                        for (var i = 0; i < commands.Count; i++)
+                            target.Add(commands[i]);
+                    }
 
-                return true;
+                    rebuild(sprite, target);
+                    return;
+                }
+
+                rebuild(sprite, null);
+            }
+
+            private void rebuild(OsbSprite sprite, IList<ICommand> commands)
+            {
+                if (sprite == null)
+                    return;
+
+                if (displayTimelinesField?.GetValue(sprite) is IList displayTimelines)
+                    displayTimelines.Clear();
+
+                currentCommandGroupField?.SetValue(sprite, null);
+                groupEndActionField?.SetValue(sprite, null);
+                initializeDisplayTimelinesMethod?.Invoke(sprite, null);
+
+                var hasTrigger = false;
+                if (commands != null)
+                {
+                    for (var i = 0; i < commands.Count; i++)
+                        rebuildCommand(sprite, commands[i], ref hasTrigger);
+                }
+
+                if (hasTriggerProperty != null)
+                {
+                    var setter = hasTriggerProperty.GetSetMethod(true);
+                    setter?.Invoke(sprite, new object[] { hasTrigger });
+                }
+
+                clearStartEndTimesMethod?.Invoke(sprite, null);
+            }
+
+            private void rebuildCommand(OsbSprite sprite, ICommand command, ref bool hasTrigger)
+            {
+                if (command is TriggerCommand trigger)
+                {
+                    hasTrigger = true;
+                    startTriggerDisplayGroupMethod?.Invoke(sprite, new object[] { trigger });
+                    foreach (var nested in trigger.Commands)
+                        rebuildCommand(sprite, nested, ref hasTrigger);
+                    endDisplayGroupMethod?.Invoke(sprite, null);
+                    return;
+                }
+
+                if (command is LoopCommand loop)
+                {
+                    startLoopDisplayGroupMethod?.Invoke(sprite, new object[] { loop });
+                    foreach (var nested in loop.Commands)
+                        rebuildCommand(sprite, nested, ref hasTrigger);
+                    endDisplayGroupMethod?.Invoke(sprite, null);
+                    return;
+                }
+
+                addDisplayCommandMethod?.Invoke(sprite, new object[] { command });
             }
         }
 
         private sealed class CommandAccessor
         {
-            private readonly PropertyInfo startTimeProperty;
-            private readonly PropertyInfo endTimeProperty;
             private readonly PropertyInfo easingProperty;
             private readonly PropertyInfo startValueProperty;
             private readonly PropertyInfo endValueProperty;
+            private readonly Func<OsbEasing, double, double, object, object, ICommand> factory;
+            private readonly bool requiresMatchingValues;
 
-            private CommandAccessor(bool isSupported, PropertyInfo startTimeProperty, PropertyInfo endTimeProperty, PropertyInfo easingProperty, PropertyInfo startValueProperty, PropertyInfo endValueProperty)
+            private CommandAccessor(Type commandType, PropertyInfo startValueProperty, PropertyInfo endValueProperty, PropertyInfo easingProperty, Func<OsbEasing, double, double, object, object, ICommand> factory, bool requiresMatchingValues)
             {
-                IsSupported = isSupported;
-                this.startTimeProperty = startTimeProperty;
-                this.endTimeProperty = endTimeProperty;
+                CommandType = commandType;
                 this.easingProperty = easingProperty;
                 this.startValueProperty = startValueProperty;
                 this.endValueProperty = endValueProperty;
+                this.factory = factory;
+                this.requiresMatchingValues = requiresMatchingValues;
+
+                IsSupported = factory != null && startValueProperty != null && endValueProperty != null && easingProperty != null;
+                TypeKey = commandType.Name;
             }
 
             public bool IsSupported { get; }
+            public string TypeKey { get; }
+            public Type CommandType { get; }
 
             public static CommandAccessor Create(Type commandType)
             {
-                var startTimeProperty = commandType.GetProperty("StartTime", BindingFlags.Instance | BindingFlags.Public);
-                var endTimeProperty = commandType.GetProperty("EndTime", BindingFlags.Instance | BindingFlags.Public);
                 var easingProperty = commandType.GetProperty("Easing", BindingFlags.Instance | BindingFlags.Public);
                 var startValueProperty = commandType.GetProperty("StartValue", BindingFlags.Instance | BindingFlags.Public);
                 var endValueProperty = commandType.GetProperty("EndValue", BindingFlags.Instance | BindingFlags.Public);
 
-                if (startTimeProperty == null || endTimeProperty == null || easingProperty == null || startValueProperty == null || endValueProperty == null)
-                    return new CommandAccessor(false, null, null, null, null, null);
+                if (easingProperty == null || startValueProperty == null || endValueProperty == null)
+                    return new CommandAccessor(commandType, startValueProperty, endValueProperty, easingProperty, null, false);
 
-                return new CommandAccessor(true, startTimeProperty, endTimeProperty, easingProperty, startValueProperty, endValueProperty);
+                Func<OsbEasing, double, double, object, object, ICommand> factory = null;
+                var constructors = commandType.GetConstructors(BindingFlags.Instance | BindingFlags.Public);
+
+                foreach (var constructor in constructors)
+                {
+                    var parameters = constructor.GetParameters();
+                    if (parameters.Length == 5 &&
+                        parameters[0].ParameterType == typeof(OsbEasing) &&
+                        parameters[1].ParameterType == typeof(double) &&
+                        parameters[2].ParameterType == typeof(double) &&
+                        parameters[3].ParameterType == startValueProperty.PropertyType &&
+                        parameters[4].ParameterType == endValueProperty.PropertyType)
+                    {
+                        factory = (easing, start, end, startValue, endValue)
+                            => (ICommand)constructor.Invoke(new[] { easing, start, end, startValue, endValue });
+                        return new CommandAccessor(commandType, startValueProperty, endValueProperty, easingProperty, factory, false);
+                    }
+
+                    if (parameters.Length == 4 &&
+                        parameters[0].ParameterType == typeof(OsbEasing) &&
+                        parameters[1].ParameterType == typeof(double) &&
+                        parameters[2].ParameterType == typeof(double) &&
+                        parameters[3].ParameterType == startValueProperty.PropertyType)
+                    {
+                        factory = (easing, start, end, startValue, endValue)
+                        {
+                            if (!Equals(startValue, endValue))
+                                return null;
+                            return (ICommand)constructor.Invoke(new[] { easing, start, end, startValue });
+                        };
+                        return new CommandAccessor(commandType, startValueProperty, endValueProperty, easingProperty, factory, true);
+                    }
+                }
+
+                return new CommandAccessor(commandType, startValueProperty, endValueProperty, easingProperty, null, false);
+            }
+
+            public ICommand Create(OsbEasing easing, double startTime, double endTime, object startValue, object endValue)
+            {
+                if (!IsSupported)
+                    return null;
+
+                if (requiresMatchingValues && !Equals(startValue, endValue))
+                    return null;
+
+                return factory(easing, startTime, endTime, startValue, endValue);
+            }
+
+            public ICommand Clone(ICommand command)
+            {
+                if (!IsSupported)
+                    return null;
+
+                var easing = GetEasing(command);
+                var startTime = sanitize(command.StartTime);
+                var endTime = sanitize(command.EndTime);
+                var startValue = GetStartValue(command);
+                var endValue = GetEndValue(command);
+                return Create(easing, startTime, endTime, startValue, endValue);
             }
 
             public object GetStartValue(ICommand command) => startValueProperty?.GetValue(command);
             public object GetEndValue(ICommand command) => endValueProperty?.GetValue(command);
             public OsbEasing GetEasing(ICommand command) => easingProperty != null ? (OsbEasing)easingProperty.GetValue(command) : OsbEasing.None;
-
-            public void SetStartTime(ICommand command, double value) => startTimeProperty?.SetValue(command, value);
-            public void SetEndTime(ICommand command, double value) => endTimeProperty?.SetValue(command, value);
-            public void SetStartValue(ICommand command, object value) => startValueProperty?.SetValue(command, value);
-            public void SetEndValue(ICommand command, object value) => endValueProperty?.SetValue(command, value);
-            public void SetEasing(ICommand command, OsbEasing easing) => easingProperty?.SetValue(command, easing);
         }
 
         private sealed class Entry

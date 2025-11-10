@@ -28,6 +28,8 @@ namespace StorybrewEditor.Storyboarding
 
         public Effect Effect { get; }
 
+        private readonly LayerCommandAggregator commandAggregator = new LayerCommandAggregator();
+
         private bool visible = true;
         public bool Visible
         {
@@ -155,6 +157,7 @@ namespace StorybrewEditor.Storyboarding
 
         public void PostProcess(CancellationToken token)
         {
+            commandAggregator.ApplyOrdering(segment);
             segment.PostProcess();
 
             startTime = segment.StartTime;
@@ -169,10 +172,16 @@ namespace StorybrewEditor.Storyboarding
         }
 
         public void WriteOsb(TextWriter writer, ExportSettings exportSettings, CancellationToken token = default)
-            => WriteOsb(writer, exportSettings, osbLayer, null, token);
+        {
+            commandAggregator.ApplyOrdering(segment);
+            segment.WriteOsb(writer, exportSettings, osbLayer, null, token);
+        }
 
         public override void WriteOsb(TextWriter writer, ExportSettings exportSettings, OsbLayer layer, StoryboardTransform transform, CancellationToken token = default)
-            => segment.WriteOsb(writer, exportSettings, osbLayer, transform, token);
+        {
+            commandAggregator.ApplyOrdering(segment);
+            segment.WriteOsb(writer, exportSettings, osbLayer, transform, token);
+        }
 
         public void CopySettings(EditorStoryboardLayer other, bool copyGuid = false)
         {
@@ -191,5 +200,22 @@ namespace StorybrewEditor.Storyboarding
         }
 
         public override string ToString() => $"name:{name}, id:{Identifier}, layer:{osbLayer}, diffSpec:{diffSpecific}";
+
+        internal void NotifyObjectCreated(StoryboardObject storyboardObject)
+            => commandAggregator.TrackObject(storyboardObject);
+
+        internal void NotifyObjectDiscarded(StoryboardObject storyboardObject)
+            => commandAggregator.UntrackObject(storyboardObject);
+
+        internal void RegisterContributor(Effect contributor)
+        {
+            if (contributor == null)
+                return;
+
+            commandAggregator.RegisterContributor(contributor);
+        }
+
+        public void SetContributorPriority(Guid contributorId, int priority)
+            => commandAggregator.SetContributorPriority(contributorId, priority);
     }
 }

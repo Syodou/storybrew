@@ -67,7 +67,9 @@ namespace StorybrewEditor.Storyboarding
 
         public List<EditorStoryboardLayer> EditorLayers = new List<EditorStoryboardLayer>();
 
-        private readonly Dictionary<string, EditorStoryboardLayer> layersByIdentifier = new Dictionary<string, EditorStoryboardLayer>(StringComparer.Ordinal);
+        private readonly Dictionary<string, EditorStoryboardLayer> layersByIdentifier =
+            new Dictionary<string, EditorStoryboardLayer>(StringComparer.Ordinal);
+
         private EditorStoryboardLayer unnamedLayer;
 
         public EditorGeneratorContext(Effect effect,
@@ -87,63 +89,79 @@ namespace StorybrewEditor.Storyboarding
 
             StoryboardContext = storyboardContext;
 
+            // When using shared storyboard context: sync existing layers
             if (StoryboardContext != null)
             {
-                foreach (var layer in StoryboardContext.SnapshotLayers().OfType<EditorStoryboardLayer>())
+                foreach (var layer in StoryboardContext
+                    .SnapshotLayers()
+                    .OfType<EditorStoryboardLayer>())
                     registerLayer(layer);
             }
         }
 
+        // ✅ FIXED: Always returns the SAME instance for the SAME identifier
         protected override StoryboardLayer GetOrCreateLayer(string identifier)
         {
+            // Normalize null → ""
             if (identifier == null)
-            {
-                if (unnamedLayer == null)
-                    unnamedLayer = registerLayer(new EditorStoryboardLayer(identifier, effect));
-                return unnamedLayer;
-            }
+                identifier = "";
 
+            // Already exists?
             if (layersByIdentifier.TryGetValue(identifier, out var existing))
                 return existing;
 
-            var layer = registerLayer(new EditorStoryboardLayer(identifier, effect));
+            // Create new layer
+            var layer = new EditorStoryboardLayer(identifier, effect);
+
+            // Register new layer
+            registerLayer(layer);
+
+            // Bind cache
             layersByIdentifier[identifier] = layer;
+
             return layer;
         }
 
+        // Used by scripts enumerating local layers
         protected override IEnumerable<StoryboardLayer> EnumerateLocalLayers()
             => EditorLayers;
 
         protected override void OnLayerCreated(StoryboardLayer layer)
         {
             if (layer is EditorStoryboardLayer editorLayer)
-                registerLayer(editorLayer);
+                RebindLayer(editorLayer.Identifier, editorLayer);
         }
 
         protected override void OnLayerAccessed(StoryboardLayer layer)
         {
             if (layer is EditorStoryboardLayer editorLayer)
-                registerLayer(editorLayer);
+                RebindLayer(editorLayer.Identifier, editorLayer);
         }
 
+        // ✅ Ensures shared-context created layers sync with editor cache
+        internal void RebindLayer(string identifier, StoryboardLayer layer)
+        {
+            layersByIdentifier[identifier ?? ""] = (EditorStoryboardLayer)layer;
+            if (!EditorLayers.Contains(layer))
+                EditorLayers.Add((EditorStoryboardLayer)layer);
+        }
+
+        // ✅ Clean, guaranteed-unique register
         private EditorStoryboardLayer registerLayer(EditorStoryboardLayer layer)
         {
             if (layer == null)
                 return null;
 
-            if (layer.Identifier != null)
-            {
-                if (layersByIdentifier.TryGetValue(layer.Identifier, out var existing))
-                {
-                    if (!ReferenceEquals(existing, layer))
-                        layersByIdentifier[layer.Identifier] = layer;
-                }
-                else layersByIdentifier.Add(layer.Identifier, layer);
-            }
+            var key = layer.Identifier ?? "";
 
+            // Always bind latest instance
+            layersByIdentifier[key] = layer;
+
+            // Ensure global tracking
             if (!EditorLayers.Contains(layer))
                 EditorLayers.Add(layer);
 
+            // Assign unnamed layer
             if (layer.Identifier == null)
                 unnamedLayer ??= layer;
 
@@ -157,8 +175,8 @@ namespace StorybrewEditor.Storyboarding
             => log.AppendLine(message);
 
         #region Audio data
-
         private Dictionary<string, FftStream> fftAudioStreams = new Dictionary<string, FftStream>();
+
         private FftStream getFftStream(string path)
         {
             path = Path.GetFullPath(path);
@@ -177,7 +195,6 @@ namespace StorybrewEditor.Storyboarding
 
         public override float GetFftFrequency(string path = null)
             => getFftStream(path ?? effect.Project.AudioPath).Frequency;
-
         #endregion
 
         public void DisposeResources()

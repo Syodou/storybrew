@@ -154,9 +154,7 @@ namespace StorybrewEditor.Storyboarding
         {
             var editorLayer = (EditorStoryboardLayer)layer;
 
-            layersByIdentifier[identifier ?? ""] = editorLayer;
-            if (!EditorLayers.Contains(layer))
-                EditorLayers.Add(editorLayer);
+            indexLayer(editorLayer);
 
             editorLayer.RegisterContributor(effect);
         }
@@ -167,22 +165,81 @@ namespace StorybrewEditor.Storyboarding
             if (layer == null)
                 return null;
 
-            var key = layer.Identifier ?? "";
-
-            // Always bind latest instance
-            layersByIdentifier[key] = layer;
-
-            // Ensure global tracking
-            if (!EditorLayers.Contains(layer))
-                EditorLayers.Add(layer);
-
-            // Assign unnamed layer
-            if (layer.Identifier == null)
-                unnamedLayer ??= layer;
+            indexLayer(layer);
 
             layer.RegisterContributor(effect);
 
             return layer;
+        }
+
+        private void indexLayer(EditorStoryboardLayer layer)
+        {
+            if (layer == null)
+                return;
+
+            var key = layer.Identifier ?? "";
+
+            if (layersByIdentifier.TryGetValue(key, out var previous) && !ReferenceEquals(previous, layer))
+            {
+                replaceEditorLayer(previous, layer);
+            }
+            else if (!EditorLayers.Contains(layer))
+            {
+                EditorLayers.Add(layer);
+            }
+
+            layersByIdentifier[key] = layer;
+
+            if (layer.Identifier == null)
+                unnamedLayer = layer;
+        }
+
+        private void replaceEditorLayer(EditorStoryboardLayer previous, EditorStoryboardLayer replacement)
+        {
+            if (previous == null || replacement == null)
+                return;
+
+            var index = EditorLayers.IndexOf(previous);
+            if (index >= 0)
+                EditorLayers[index] = replacement;
+            else if (!EditorLayers.Contains(replacement))
+                EditorLayers.Add(replacement);
+
+            if (ReferenceEquals(unnamedLayer, previous) && replacement.Identifier == null)
+                unnamedLayer = replacement;
+
+            ensureUniqueEntry(replacement);
+        }
+
+        private void ensureUniqueEntry(EditorStoryboardLayer replacement)
+        {
+            var identifier = replacement.Identifier;
+            var kept = false;
+
+            for (var i = 0; i < EditorLayers.Count; i++)
+            {
+                var candidate = EditorLayers[i];
+                if (!string.Equals(candidate.Identifier, identifier, StringComparison.Ordinal))
+                    continue;
+
+                if (!kept)
+                {
+                    if (!ReferenceEquals(candidate, replacement))
+                        EditorLayers[i] = replacement;
+                    kept = true;
+                    continue;
+                }
+
+                if (!ReferenceEquals(candidate, replacement))
+                {
+                    EditorLayers.RemoveAt(i);
+                    i--;
+                    continue;
+                }
+
+                EditorLayers.RemoveAt(i);
+                i--;
+            }
         }
 
         public override void AddDependency(string path)

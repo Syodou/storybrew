@@ -62,6 +62,7 @@ namespace StorybrewEditor.Storyboarding
                 InitialPosition = initialPosition,
             };
             storyboardObjects.Add(storyboardObject);
+            Layer.NotifyObjectCreated(storyboardObject);
             displayableObjects.Add(storyboardObject);
             displayableBuckets = null;
             return storyboardObject;
@@ -82,6 +83,7 @@ namespace StorybrewEditor.Storyboarding
                 InitialPosition = initialPosition,
             };
             storyboardObjects.Add(storyboardObject);
+            Layer.NotifyObjectCreated(storyboardObject);
             displayableObjects.Add(storyboardObject);
             displayableBuckets = null;
             return storyboardObject;
@@ -99,6 +101,7 @@ namespace StorybrewEditor.Storyboarding
                 Volume = volume,
             };
             storyboardObjects.Add(storyboardObject);
+            Layer.NotifyObjectCreated(storyboardObject);
             eventObjects.Add(storyboardObject);
             return storyboardObject;
         }
@@ -131,6 +134,7 @@ namespace StorybrewEditor.Storyboarding
             {
                 segment = new EditorStoryboardSegment(Effect, Layer, identifier);
                 storyboardObjects.Add(segment);
+                Layer.NotifyObjectCreated(segment);
                 displayableObjects.Add(segment);
                 displayableBuckets = null;
                 segments.Add(segment);
@@ -144,6 +148,7 @@ namespace StorybrewEditor.Storyboarding
         public override void Discard(StoryboardObject storyboardObject)
         {
             storyboardObjects.Remove(storyboardObject);
+            Layer.NotifyObjectDiscarded(storyboardObject);
             if (storyboardObject is DisplayableObject displayableObject)
             {
                 displayableObjects.Remove(displayableObject);
@@ -214,6 +219,36 @@ namespace StorybrewEditor.Storyboarding
                     foreach (var displayableObject in currentBucket)
                         displayableObject.Draw(drawContext, camera, bounds, opacity, localTransform, project, frameStats);
             }
+        }
+
+        internal IReadOnlyList<StoryboardObject> RawObjects => storyboardObjects;
+
+        internal void ReorderObjects(IReadOnlyList<StoryboardObject> ordered)
+        {
+            if (ordered == null)
+                throw new ArgumentNullException(nameof(ordered));
+
+            if (ordered.Count != storyboardObjects.Count)
+                throw new InvalidOperationException("Reordered storyboard object list size mismatch.");
+
+            storyboardObjects.Clear();
+            storyboardObjects.AddRange(ordered);
+
+            displayableObjects.Clear();
+            eventObjects.Clear();
+            segments.Clear();
+
+            foreach (var storyboardObject in storyboardObjects)
+            {
+                if (storyboardObject is DisplayableObject displayableObject)
+                    displayableObjects.Add(displayableObject);
+                if (storyboardObject is EventObject eventObject)
+                    eventObjects.Add(eventObject);
+                if (storyboardObject is EditorStoryboardSegment segment)
+                    segments.Add(segment);
+            }
+
+            displayableBuckets = null;
         }
 
         public void PostProcess()

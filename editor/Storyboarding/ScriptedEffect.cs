@@ -115,7 +115,8 @@ namespace StorybrewEditor.Storyboarding
                 cancellationTokenSource.Token.ThrowIfCancellationRequested();
 
                 changeStatus(EffectStatus.Updating);
-                script.Generate(context);
+                using (context.Activate())
+                    script.Generate(context);
 
                 cancellationTokenSource.Token.ThrowIfCancellationRequested();
 
